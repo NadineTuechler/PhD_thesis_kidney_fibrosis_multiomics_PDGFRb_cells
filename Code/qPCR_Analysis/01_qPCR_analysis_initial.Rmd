@@ -1,0 +1,197 @@
+---
+title: "initial qPCR plots and t.test"
+output:
+  html_document:
+    keep_md: yes
+    toc: yes
+    theme: united
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+# General settings
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  include = TRUE,
+  cache = TRUE,
+  cache.lazy = FALSE,
+  eval = TRUE,
+  fig.width = 4 * (1 + sqrt(5)) / 2, 
+  fig.height = 4,
+  dpi = 700
+)
+#knitr::opts_knit$set(root.dir = "/Users//")
+```
+
+## Packages
+
+```{r, message=F, warning =F, include=}
+library(tidyverse)
+library(here)
+library(ggplot2); theme_set(cowplot::theme_cowplot(font_size = 15))
+library("reshape2")
+library(ggrepel)
+library(knitr)
+library(Biostrings)
+library(RColorBrewer)
+library(ggpubr)
+library(rstatix)
+library(gtools)
+library(patchwork)
+
+mutate <- dplyr::mutate
+select <- dplyr::select
+group_by <- dplyr::group_by
+```
+
+# 1. Data
+```{r}
+data_initial <- openxlsx::read.xlsx(here("data","qPCR_NT21_009_019_20240125.xlsx"))
+data_setA <- openxlsx::read.xlsx(here("data","qPCR_NT21_067_NT22_002_003_setupA_20240125.xlsx"))
+data_setB <- openxlsx::read.xlsx(here("data","qPCR_NT21_067_NT22_002_003_setupB_20240125.xlsx"))
+```
+
+## save plot function
+```{r}
+# define directory to save plots
+plotdir <- here("figures")
+
+# plot saving function 
+save_my_plot <- function(plot, name, height, width){
+  ggsave(plot, height = height, width = width, 
+         filename = paste(plotdir, Sys.Date(), "_", name, sep = ""))
+}
+
+```
+
+
+# 2. initial (NT21_009, NT21_019), still used + 0.5% FBS in media
+t.test
+```{r}
+data_df <- data_initial 
+
+stat.test <- data_df %>% 
+  drop_na() %>% 
+  filter(gene != "GAPDH", time != "0h", treatment != "ctrl", 
+  gene != "GAPDH 1:50", gene != "GAPDH 1:100", gene != "FN1 1:50", 
+  gene != "ACTA2_2", gene != "ACTA2_3") %>%
+  mutate(gene = fct_recode(gene, "FN1" = "FN1 1:100")) %>%
+  mutate(gene = fct_recode(gene, "ACTA2" = "ACTA2_1")) %>%
+    mutate(gene = fct_recode(gene, "VIM" = "VIM1")) %>%
+  group_by(gene,time) %>% 
+  t_test(percentage ~ 1, mu=100) %>% 
+  mutate(y.position = 600) %>% 
+  mutate(pstar = stars.pval(p))
+
+
+p_initial <- data_df %>% 
+  drop_na() %>% 
+  filter(gene != "GAPDH", time != "0h", treatment != "ctrl", 
+  gene != "GAPDH 1:50", gene != "GAPDH 1:100", gene != "FN1 1:50", 
+  gene != "ACTA2_2", gene != "ACTA2_3") %>% # exclude primer 2 and 3 for ACTA2
+  mutate(gene = fct_recode(gene, "FN1" = "FN1 1:100")) %>%
+  mutate(gene = fct_recode(gene, "ACTA2" = "ACTA2_1")) %>%
+  mutate(gene = fct_recode(gene, "VIM" = "VIM1")) %>%
+  mutate(time = fct_relevel(time, "8h", "24h","48h", "72h")) %>%
+  mutate(group = paste(gene, replicate, treatment, time, sep = "_")) %>% 
+  ggplot(aes(x = time, y = percentage, group = time)) +
+  stat_summary(fun = "mean", geom = "bar", fill = "grey") +  
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, 
+               color = "black") +  
+  geom_jitter(size = 1.5, width = .25, aes(shape = replicate), 
+              color = "#80146E", alpha= 0.8) +
+  geom_hline(yintercept = 100,color = "gray26", linetype = "longdash") +
+  facet_grid(~gene) +
+  stat_pvalue_manual(stat.test, label="pstar", xmin="time",xmax=NULL, 
+                     size = 5, y.position = 350)+ 
+  ggtitle("mRNA expression changes upon TGFb treatment")+
+  ylab("mRNA levels (% of ctrl treated cells at respective time)") +
+  cowplot::panel_border()
+
+p_initial
+
+#save plot
+save_my_plot(plot = p_initial, name = "/qPCR_initial_1_final.pdf", 5.5, 10)
+```
+
+
+# 3 compare experimental set ups
+## 3.1 set up A (NT21_067, NT22_002, NT22_003) (harvest at different tps)
+t.test
+```{r}
+data_df <- data_setA 
+
+stat.test <- data_df %>% 
+  drop_na() %>% 
+  filter(gene != "GAPDH", time != "0h", treatment != "ctrl", gene != "COL3") %>% 
+    mutate(gene = fct_recode(gene, "VIM" = "VIM1")) %>%
+  group_by(gene,time) %>% 
+  t_test(percentage ~ 1, mu=100) %>% 
+  mutate(y.position = 1150) %>% 
+  mutate(pstar = stars.pval(p))
+
+
+p_setA <- data_df %>% 
+  drop_na() %>% 
+  filter(gene != "GAPDH", time != "0h", treatment != "ctrl", gene != "COL3") %>% # filter col3 as CT values are > 30
+    mutate(gene = fct_recode(gene, "VIM" = "VIM1")) %>%
+  mutate(group = paste(gene, replicate, treatment, time, sep = "_")) %>% 
+  ggplot(aes(x = time, y = percentage, group = time)) +
+  stat_summary(fun = "mean", geom = "bar", fill = "grey") +  
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black") + 
+  geom_jitter(size = 1.5, width = .25, aes(shape = replicate), color = "#80146E", alpha= 0.8) +
+  geom_hline(yintercept = 100,color = "gray26", linetype = "longdash") +
+  facet_grid(~gene) +
+  stat_pvalue_manual(stat.test, label="pstar", xmin="time",xmax=NULL, size = 5)+ 
+  ggtitle("Experimental set-up A")+
+  ylab("mRNA levels (% of ctrl treated cells at respective time)") +
+  cowplot::panel_border()
+
+p_setA
+
+#save plot
+save_my_plot(plot = p_setA, name = "/qPCR_setupA_1.png", 5.5, 11.5)
+```
+
+
+## 3.2 set up B (NT21_067, NT22_002, NT22_003) (harvest at different tps)
+t.test
+```{r}
+data_df <- data_setB 
+
+stat.test <- data_df %>% 
+  drop_na() %>% 
+  filter(gene != "GAPDH", time != "0h", treatment != "ctrl", gene != "COL3") %>% 
+    mutate(gene = fct_recode(gene, "VIM" = "VIM1")) %>%
+  group_by(gene,time) %>% 
+  t_test(percentage ~ 1, mu=100) %>% 
+  mutate(y.position = 1150) %>% 
+  mutate(pstar = stars.pval(p))
+
+
+p_setB <- data_df %>% 
+  drop_na() %>% 
+  filter(gene != "GAPDH", time != "0h", treatment != "ctrl", gene != "COL3") %>% # filter col3 as CT values are > 30
+    mutate(gene = fct_recode(gene, "VIM" = "VIM1")) %>%
+  mutate(group = paste(gene, replicate, treatment, time, sep = "_")) %>% 
+  ggplot(aes(x = time, y = percentage, group = time)) +
+  stat_summary(fun = "mean", geom = "bar", fill = "grey") + 
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black") + 
+  geom_jitter(size = 1.5, width = .25, aes(shape = replicate), color = "#80146E", alpha= 0.8) +
+  geom_hline(yintercept = 100,color = "gray26", linetype = "longdash") +
+  facet_grid(~gene) +
+  stat_pvalue_manual(stat.test, label="pstar", xmin="time",xmax=NULL, size = 5)+
+  ggtitle("Experimental set-up B")+
+  ylab("mRNA levels (% of ctrl treated cells at respective time)") +
+  cowplot::panel_border()
+
+p_setB
+
+#save plot
+save_my_plot(plot = p_setB, name = "/qPCR_setupB_1.pdf", 5.5, 11.5)
+```

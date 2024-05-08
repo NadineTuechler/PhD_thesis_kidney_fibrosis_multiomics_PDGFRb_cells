@@ -1,0 +1,1598 @@
+---
+title: "qPCR plots and statistics - validaiton experiments"
+output:
+  html_document:
+    keep_md: yes
+    toc: yes
+    theme: united
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+# General settings
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  include = TRUE,
+  cache = TRUE,
+  cache.lazy = FALSE,
+  eval = TRUE,
+  fig.width = 4 * (1 + sqrt(5)) / 2, 
+  fig.height = 4,
+  dpi = 700
+)
+```
+
+## Packages
+
+```{r, message=F, warning =F, include=}
+library(tidyverse)
+library(ggplot2); theme_set(cowplot::theme_cowplot(font_size = 15))
+library("reshape2")
+library(ggrepel)
+library(knitr)
+library(Biostrings)
+library(RColorBrewer)
+library(ggpubr)
+library(rstatix)
+library(gtools)
+library(patchwork)
+library(here)
+
+mutate <- dplyr::mutate
+select <- dplyr::select
+group_by <- dplyr::group_by
+```
+
+```{r}
+options(ggplot2.discrete.colour= c("orange3", "darkslateblue", "darkred", "darkgreen", "darkgrey", "darkviolet"))
+options(ggplot2.discrete.fill= c("orange3", "darkslateblue", "darkred", "darkgreen", "darkgrey", "darkviolet"))
+```
+
+# 1. Data
+
+```{r}
+data_df_1 <- openxlsx::read.xlsx(here("data","qPCR_NT23_009_010_20240123_updated.xlsx"))
+
+# second set of siRNAs tested
+data_df_2 <- openxlsx::read.xlsx(here("data", "qPCR_NT23_013_018_021_NT24_001_20240124.xlsx"))
+
+# double knock-downs
+data_df_3  <- openxlsx::read.xlsx(here("data","qPCR_NT23_016_20240123.xlsx")) 
+
+# FN1 knock downs
+data_fn1 <- openxlsx::read.xlsx(here("data","qPCR_NT23_FN1_20240123.xlsx"))
+
+```
+
+## save plot function
+```{r}
+# define directory to save plots
+plotdir <- here("figures")
+
+# plot saving function 
+save_my_plot <- function(plot, name, height, width){
+  ggsave(plot, height = height, width = width, 
+         filename = file.path(plotdir, paste0(Sys.Date(), "_", name, sep = "")))
+}
+
+```
+
+
+
+# 2. first set of siRNAs
+## Data overview of all replicates
+
+```{r}
+data_df <- data_df_1 %>%
+  filter(percentage <= 4000)
+
+extra_points <- data_df %>% 
+  filter(gene != "GAPDH") %>%
+  filter(treatment == "ctrl", time == "48h") %>% 
+  mutate(treatment = "TGF") %>% 
+  # filter(treatment == "ctrl" & time == "48h") %>% 
+  # mutate(time = "48h", treatment = "TGF") %>% 
+  distinct(time, percentage, replicate, treatment, gene, siRNA) 
+
+p1 <- data_df %>% 
+  drop_na() %>% 
+  filter(gene != "GAPDH") %>%
+  bind_rows(extra_points)%>% 
+  mutate(group = paste(gene, replicate, treatment, sep = "_")) %>% 
+  ggplot(aes(x = time, y = percentage, shape = replicate, colour = treatment, group = group)) +
+  geom_hline(yintercept = 100) +
+  geom_point() +
+  geom_line() +
+  facet_grid(gene ~siRNA) +
+  ggtitle("first siRNAs")+
+  ylim(0,500)+
+  cowplot::panel_border()
+
+p1
+
+# save plot
+save_my_plot(plot = p1, name = "/qPCR_first_siRNAs.png", 16, 8)
+
+```
+
+
+## Averages of replicates - data overview
+
+```{r}
+ctl_df <- data_df %>% 
+  filter(gene != "GAPDH") %>%
+  drop_na() %>% 
+  bind_rows(extra_points) %>% 
+  filter(siRNA == "siNeg9") %>% 
+  select(gene, time, treatment, replicate, ctl_siNeg9 = percentage)
+
+siRNA_df <- data_df %>% 
+  filter(gene != "GAPDH") %>%
+  drop_na() %>% 
+  bind_rows(extra_points) %>% 
+  filter(siRNA != "siNeg9")%>% 
+  select(siRNA, gene, time, treatment, replicate, percentage)
+
+data_df_combined <-  siRNA_df %>% 
+  left_join(ctl_df, by = join_by(gene, time, treatment, replicate)) %>% 
+  select(gene, siRNA, time, treatment, replicate, ctl_siNeg9, percentage)%>% 
+  melt()
+
+p2 <- data_df_combined %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  geom_hline(yintercept = 100) +
+  geom_point() +
+  geom_line(aes(linetype = variable)) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_grid(gene ~ siRNA) +
+  ggtitle("first siRNAs")+
+  ylim(0, 500)+
+  cowplot::panel_border()
+
+p2
+
+# save plot
+save_my_plot(plot = p2, name = "/qPCR_first_siRNAs_mean_smaller.png", 16, 8)
+
+```
+
+
+## Hit calling
+
+create df with t and p values 
+```{r}
+# perform t-test per time, per condition (treatment), per gene (target gene) for each siRNA vs siNeg9
+
+tt <- data_df_combined %>% 
+  select(siRNA, gene, time, value, treatment, variable)
+
+
+test_df <- tt %>% 
+  # remove GAPDH because not testable
+  filter(gene != "GAPDH") %>% 
+  # define groups for test (one test per group)
+  group_by(siRNA, gene, time, treatment) %>% 
+  # nest data to run test per group
+  nest(data = c(value, variable))%>%
+  mutate(t = purrr::map(data, 
+                          function(df) {
+                            # long to wide format
+                            df <- df %>% 
+                            mutate(rowID = rep(c(1:(nrow(df)/2)), 2)) %>% 
+                              dcast(rowID ~ variable, value.var = "value")
+                            # run test and extract t-value
+                            t <- as.numeric(t.test(df$percentage, df$ctl_siNeg9)$statistic[["t"]])
+                            
+                          }
+                          )) %>%
+  mutate(p = purrr::map(data, 
+                          function(df) {
+                            
+                            df <- df %>% 
+                            mutate(rowID = rep(c(1:(nrow(df)/2)), 2)) %>% 
+                              dcast(rowID ~ variable, value.var = "value")
+                            # run test and extract p-value
+                            p <- as.numeric(t.test(df$percentage, df$ctl_siNeg9)$p.value)
+                            
+                          }
+                          )) %>% 
+  select(-data) %>% 
+  unnest()
+```
+
+
+
+
+
+## 2.1 siSMAD1
+
+Averages of replicates are plotted, dottent lines are shown for the results of siNeg9 treatment (untargeting control siRNA)
+blue lines are indicative for control
+purple lines depict TGF-b treated samples
+```{r}
+# restructure factor gene
+smad1 <- data_df_combined
+smad1$gene <- factor(smad1$gene, levels = c("SMAD1", "COL1A1", "ID2", "ID3", "BHLHE40", "E2F1", "FLI1", "HNF4G", "NR4A1"))
+
+data_df_combined_smad1 <- smad1[order(smad1$gene), ]
+
+p_smad <- data_df_combined_smad1 %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  filter(siRNA == "siSMAD1") %>% 
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene, ncol=3) +
+  ggtitle("siSMAD1_a")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+  ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_smad
+
+# save plot
+save_my_plot(plot = p_smad, name = "/qPCR_first_siSMAD1_mean_new.png", 9, 7)
+
+```
+
+selection of target genes (SMAD1 and COL1A1)
+```{r}
+smad1 <- data_df_combined
+smad1$gene <- factor(smad1$gene, levels = c("SMAD1", "COL1A1", "ID2", "ID3", "BHLHE40", "E2F1", "FLI1", "HNF4G", "NR4A1"))
+
+data_df_combined_smad1 <- smad1[order(smad1$gene), ]
+
+p_smad <- data_df_combined_smad1 %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  filter(gene %in% c("SMAD1", "COL1A1")) %>%
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  filter(siRNA == "siSMAD1") %>% 
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene) +
+  ggtitle("siSMAD1_a")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+  ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_smad
+
+# save plot
+save_my_plot(plot = p_smad, name = "/qPCR_first_siSMAD1_mean_SMAD1_COL1.png", 3, 3)
+
+```
+
+
+### Anova Col1 - as an example
+For some comparisons, anova was performed. 
+Here, the mRNA expression values were taken at the last time point (96h), for the samples treated with siSMAD1 and looking at the expression changes of COL1A1.
+Here, the time point 96h was chosen as this is where the imaging data were acquired as well.
+
+illustration of data:
+```{r}
+p_time <- "96h"
+p_gene <- "COL1A1"
+p_si <- "siSMAD1"
+  
+example <- data_df %>% 
+  bind_rows(extra_points) %>% 
+   drop_na() %>% 
+  filter(gene == p_gene ) %>%
+  filter(siRNA %in% c("siNeg9", p_si)) %>% 
+  filter(time==p_time)
+
+a <- example %>% 
+  ggplot(aes(x=siRNA, y=percentage, color=treatment, shape= replicate))+
+  scale_color_manual(values = c("ctrl" = "#2BACC2", "TGF" = "#80146E"))+
+  stat_summary(aes(group = interaction(siRNA, treatment)),geom = "crossbar", fun= mean, color = "black", width = 0.4)+
+  ggtitle("96h") +
+  ylab("COL1A1 mRNA levels (% of siNeg9 treated cells at 48h)") +
+  geom_jitter(width=0.1)+
+  ylim(0,650)
+  
+a
+
+# save plot
+save_my_plot(plot = a +
+                theme(axis.title = element_text(size = 14),
+                                     legend.title = element_text(size = 14),
+                                     legend.text = element_text(size = 12),
+                                     axis.text = element_text(size = 12), 
+                                    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)), 
+                     name = "/qPCR_first_siSMAD1_points_col1.png", 6, 4)
+
+```
+
+If TGF treatment wouldn't matter, then the expression upon siSMAD1 (compared to siNeg9) would go down by the same amount for both TGF and control. This doesn't seem to be the case.
+To test this, one can check for the interaction between treatment and siRNA in a two-way ANOVA:
+
+
+influence of siRNA might be different under TGF treatment - 2 way annova to look for interaction (effect of TGF and siRNA)
+do effects add up or differently?
+does TGF have an influence on SMAD1 regulation for selected genes 
+
+Anova:
+```{r}
+aov(percentage ~ siRNA * treatment, data=example) %>% summary() 
+
+# to save anova table define file path and name
+full_path <- file.path(here("data/qPCR/processed_data"), paste0("anova_", p_si, "_", p_gene, "_", p_time, "_", format(Sys.Date(), "%Y%m%d"), ".csv"))
+
+# save anova table
+aov(percentage ~ siRNA * treatment, data=example) %>% 
+  summary() %>% 
+  .[[1]] %>% 
+  data.frame() %>%
+  write.csv(., file = full_path, row.names = TRUE)
+
+```
+
+Post hoc test to check the significance of differences between which comparisons
+```{r}
+model <- aov(percentage ~ siRNA * treatment, data=example)
+
+tukey_r <- TukeyHSD(model)
+tukey_r
+
+# save post hoc table, define first directory and file name
+full_path <- file.path(here("data/qPCR/processed_data"), paste0("tukey_firstsiRNA_", p_si, "_", p_gene, "_", p_time, "_", format(Sys.Date()), ".csv"))
+
+c <- lapply(tukey_r, as.data.frame)%>%
+  bind_rows(.)
+
+lapply(tukey_r, as.data.frame) %>%
+  bind_rows(.) %>%
+  write.csv(., file = full_path, row.names = TRUE)
+```
+
+
+
+
+## 2.2 siE2F1
+
+```{r}
+# restructure factor gene
+e2f1 <- data_df_combined
+e2f1$gene <- factor(e2f1$gene, levels = c("E2F1", "COL1A1", "SERPINE1", "ID2", "ID3", "BHLHE40", "FLI1", "HNF4G", "NR4A1", "SMAD1"))
+
+data_df_combined_e2f1 <- e2f1[order(e2f1$gene), ]
+
+
+p_e2f1 <- data_df_combined_e2f1 %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  filter(siRNA == "siE2F1") %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene, ncol=5) +
+  ggtitle("siE2F1_a")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+  ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_e2f1
+
+# save plot
+save_my_plot(plot = p_e2f1, name = "/qPCR_first_siE2F1_mean.png", 9, 11)
+
+```
+
+###Anova COL1
+illustration
+```{r}
+p_time <- "96h"
+p_gene <- "COL1A1"
+p_si <- "siE2F1"
+  
+example <- data_df %>% 
+  bind_rows(extra_points) %>% 
+   drop_na() %>% 
+  filter(gene == p_gene ) %>%
+  filter(siRNA %in% c("siNeg9", p_si)) %>% 
+  filter(time==p_time)
+
+a <- example %>% 
+  ggplot(aes(x=siRNA, y=percentage, color=treatment, shape= replicate))+
+  scale_color_manual(values = c("ctrl" = "#2BACC2", "TGF" = "#80146E"))+
+  stat_summary(aes(group = interaction(siRNA, treatment)),geom = "crossbar", fun= mean, color = "black", width = 0.4)+
+  ggtitle("96h") +
+  ylab(paste0(p_gene, " mRNA levels (% of siNeg9 treated cells at 48h)")) +
+  geom_jitter(width=0.1)+
+  ylim(0,750)
+
+a
+
+# save plot
+save_my_plot(plot = a +
+                theme(axis.title = element_text(size = 14),
+                                     legend.title = element_text(size = 14),
+                                     legend.text = element_text(size = 12),
+                                     axis.text = element_text(size = 12), 
+                                    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)), 
+                     name = paste0("/qPCR_first_siE2F1_points_", p_gene, ".png"), 6, 4)
+
+```
+
+anova
+```{r}
+aov(percentage ~ siRNA * treatment, data=example) %>% summary() 
+```
+
+## 2.3 siFLI1
+
+```{r}
+# restructure factor gene
+fli1 <- data_df_combined
+fli1$gene <- factor(fli1$gene, levels = c("FLI1", "COL1A1", "IGFBP3", "ID2", "BHLHE40", "E2F1", "HNF4G", "NR4A1", "SMAD1"))
+
+data_df_combined_fli1 <- fli1[order(fli1$gene), ]
+
+
+p_fli1 <- data_df_combined_fli1 %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  filter(siRNA == "siFLI1") %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene, ncol=3) +
+  ggtitle("siFLI1_a")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+  ylim(-10, 900)+
+  cowplot::panel_border()
+ 
+p_fli1
+
+# save plot
+save_my_plot(plot = p_fli1, name = "/qPCR_first_siFLI1_mean.png", 9, 7)
+
+```
+
+
+## 2.4 siNR4A1
+
+```{r}
+# restructure factor gene
+nr4a1 <- data_df_combined
+nr4a1$gene <- factor(nr4a1$gene, levels = c("NR4A1", "COL1A1", "SERPINE1", "SMAD7", "BHLHE40", "E2F1", "FLI1", "HNF4G", "SMAD1"))
+
+data_df_combined_nr4a1 <- nr4a1[order(nr4a1$gene), ]
+
+
+p_nr4a1 <- data_df_combined_nr4a1 %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  filter(siRNA == "siNR4A1") %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene, ncol=3) +
+  ggtitle("siNR4A1")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+  ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_nr4a1
+
+# save plot
+save_my_plot(plot = p_nr4a1, name = "/qPCR_first_siNR4A1_mean.png", 9, 7)
+
+```
+
+
+## 2.5 siHNF4G
+
+```{r}
+# restructure factor gene
+hnf4g <- data_df_combined
+hnf4g$gene <- factor(hnf4g$gene, levels = c("HNF4G", "COL1A1", "SPHK1", "BHLHE40", "E2F1", "FLI1", "NR4A1", "SMAD1"))
+
+data_df_combined_hnf4g <- hnf4g[order(hnf4g$gene), ]
+
+
+p_hnf4g <- data_df_combined_hnf4g %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  filter(siRNA == "siHNF4G") %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene, ncol=4) +
+  ggtitle("siHNF4G")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+  ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_hnf4g
+
+# save plot
+save_my_plot(plot = p_hnf4g, name = "/qPCR_first_siHNF4G_mean_4.png", 9, 9)
+
+```
+
+
+## 2.6 siBHLHE40
+
+```{r}
+# restructure factor gene
+bhlhe <- data_df_combined
+bhlhe$gene <- factor(bhlhe$gene, levels = c("BHLHE40", "COL1A1", "SMAD7", "ID2", "E2F1", "FLI1", "HNF4G","NR4A1", "SMAD1"))
+
+data_df_combined_bhlhe <- bhlhe[order(bhlhe$gene), ]
+
+
+p_bhlhe40 <- data_df_combined_bhlhe %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  filter(siRNA == "siBHLHE40") %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene, ncol=3) +
+  ggtitle("siBHLHE40")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+  ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_bhlhe40
+
+# save plot
+save_my_plot(plot = p_bhlhe40, name = "/qPCR_first_siBHLHE40_mean.png", 9, 7)
+
+```
+
+
+
+
+## Heatmap 96h
+
+For summary of all data. T-test as a first statistical test used.
+Code for the heatmap was initially provided by Sarah Kaspar (EMBL Centre for Statistical Data Analysis).
+
+First separate control and siNeg9 data frames:
+
+```{r}
+ctl_df <- data_df %>% 
+  filter(gene != "GAPDH") %>%
+  filter(time=="96h") %>% 
+  drop_na() %>% 
+  bind_rows(extra_points) %>% 
+  filter(siRNA == "siNeg9") %>% 
+  group_by(gene,time,treatment) %>% 
+  summarize(mean_siNeg9 = mean(percentage, na.rm=TRUE))
+
+siRNA_df <- data_df %>% 
+  filter(gene != "GAPDH") %>%
+  filter(time=="96h") %>% 
+  drop_na() %>% 
+  bind_rows(extra_points) %>% 
+  filter(siRNA != "siNeg9")%>% 
+  select(siRNA, gene, time, treatment, replicate, percentage) 
+
+```
+
+Calculate log fold changes in percentage between siRNA of interest and siNeg9:
+
+```{r}
+data_df_combined_s <-  siRNA_df %>% 
+  left_join(ctl_df) %>% 
+  mutate(corrected = log(percentage / mean_siNeg9)) %>% 
+  group_by(treatment,gene,siRNA) %>% 
+  summarize(mean_diff = mean(corrected,na.rm=TRUE)) %>% 
+  ungroup()
+
+```
+
+T-tests comparing the percentages between siRNA of interest and siNeg9:
+
+```{r}
+# extract levels to loop over
+genes <- siRNA_df$gene %>% unique()
+treatments <- siRNA_df$treatment %>% unique()
+siRNAs <- siRNA_df$siRNA %>%  unique()
+
+results <- data.frame(gene = NULL, treatment =NULL, siRNA = NULL, p=NULL)
+
+for(i in seq_along(genes)){
+  for(j in seq_along(treatments)){
+    for(k in seq_along(siRNAs)){
+      groupA <- siRNA_df %>% 
+        filter(gene == genes[i], treatment== treatments[j], siRNA == siRNAs[k]) %>% 
+        pull(percentage)
+      groupB <- data_df %>% 
+        filter(gene == genes[i], treatment== treatments[j], siRNA == "siNeg9", time=="96h") %>% 
+        pull(percentage)
+      pval <- ifelse((length(groupA)>0) & (length(groupB)>0), t.test(groupA, groupB)$p.value, NA)
+      #browser()
+      results <- results %>% 
+        bind_rows(data.frame(gene = genes[i], treatment = treatments[j], siRNA = siRNAs[k], p = pval))
+    }
+  }
+}
+
+# add p.values to combined df
+data_df_combined_s <- data_df_combined_s %>% 
+  left_join(results) %>% 
+   mutate(pstar = stars.pval(p))
+
+```
+
+Plot the results in a heatmap. 
+
+```{r}
+data_df_combined_s$gene <- as.factor(data_df_combined_s$gene)
+data_df_combined_s$siRNA <- as.factor(data_df_combined_s$siRNA)
+
+# plot and save as pdf
+subfolder <- format(Sys.Date(), "%Y-%m-%d")
+dir <- file.path(here("figures"), subfolder)
+# print(dir)
+
+if (!dir.exists(dir)) {
+  dir.create(dir, recursive = TRUE)
+}
+
+pdf(file.path(dir, "heatmap_qPCR_siRNA1.pdf"), width = 8 , height = 4)
+
+
+x <- data_df_combined_s %>% 
+  mutate(yadj = ifelse(treatment == "ctrl", -0.4/2, 0.4/2 ),
+         xpos = as.numeric(factor(gene)) ,
+         ypos = as.numeric(factor(siRNA)) +yadj ) %>% 
+  ggplot(aes(x=xpos, y=ypos, fill=mean_diff))+
+  geom_tile(height=0.4, width=0.8, color="gray") +
+  geom_text(aes(label = pstar), show.legend = F)+
+  scale_fill_gradient2(labels = function(breaks) paste0(breaks, ""),
+                       low = "#2BACC2", mid = "white", high = "#80146E") +
+  scale_x_continuous(breaks = 1:13, name = "gene",
+                     labels = levels(data_df_combined_s$gene)) +
+  scale_y_continuous(breaks = 1:6, name = "siRNA",
+                     labels = levels(data_df_combined_s$siRNA)) +
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1))+
+  labs(title="lower: ctrl, upper:TGFb")+
+  coord_fixed()+
+  NULL
+
+x
+
+dev.off()
+```
+
+save as png
+```{r}
+# png(file.path(dir, "heatmap_qPCR_siRNA1.png"), width = 3400 , height = 1750, res = 400)
+# 
+# data_df_combined_s %>% 
+#   mutate(yadj = ifelse(treatment == "ctrl", -0.4/2, 0.4/2 ),
+#          xpos = as.numeric(factor(gene)) ,
+#          ypos = as.numeric(factor(siRNA)) +yadj ) %>% 
+#   ggplot(aes(x=xpos, y=ypos, fill=mean_diff))+
+#   geom_tile(height=0.4, width=0.8, color="gray") +
+#   geom_text(aes(label = pstar), show.legend = FALSE)+
+#   scale_fill_gradient2(labels = function(breaks) paste0(breaks, ""),
+#                        low = "#2BACC2", mid = "white", high = "#80146E") +
+#   scale_x_continuous(breaks = 1:13, name = "gene",
+#                      labels = levels(data_df_combined_s$gene)) +
+#   scale_y_continuous(breaks = 1:6, name = "siRNA",
+#                      labels = levels(data_df_combined_s$siRNA)) +
+#   theme_classic()+
+#   theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1))+
+#   labs(title="lower: ctrl, upper:TGFb")+
+#   coord_fixed()+
+#   NULL
+# 
+# dev.off()
+
+
+```
+
+
+
+
+# 3. second set of siRNAs
+```{r}
+
+data_df <- data_df_2 
+
+
+# might have to exclude NT23_013 siSMAD1 48h as the Ct values are mostly above 30 (low mRNA concentration!)
+# problem with COL1a2 primers --> data should not be used 
+```
+
+data overview for all replicates
+```{r}
+extra_points <- data_df %>% 
+    # exclude siSMAD1, gene HNF4G rep a  
+  filter(siRNA != "siSMAD1" | gene != "HNF4G" | replicate != "A") %>%
+  filter(gene != "GAPDH") %>%
+  filter(treatment == "ctrl", time == "48h") %>% 
+  mutate(treatment = "TGF") %>% 
+  distinct(time, percentage, replicate, treatment, gene, siRNA) 
+
+p3 <- data_df %>% 
+  drop_na() %>% 
+  filter(gene != "GAPDH") %>%
+  bind_rows(extra_points)%>% 
+  mutate(group = paste(gene, replicate, treatment, sep = "_")) %>% 
+  ggplot(aes(x = time, y = percentage, shape = replicate, colour = treatment, group = group)) +
+  geom_hline(yintercept = 100) +
+  geom_point() +
+  geom_line() +
+  facet_grid(gene ~siRNA) +
+  ggtitle("second set of siRNAs")+
+  ylim(0,1000)+
+  cowplot::panel_border()
+
+p3
+
+# save plots
+save_my_plot(plot = p3, name = "/qPCR_second_siRNAs_.png",30,10)
+
+```
+
+
+## data overview with averages
+```{r}
+ctl_df <- data_df %>% 
+    # exclude siSMAD1, gene HNF4G rep a  
+  #filter(siRNA != "siSMAD1" | gene != "HNF4G" | replicate != "A") %>%
+  filter(gene != "GAPDH") %>%
+  drop_na() %>% 
+  bind_rows(extra_points) %>% 
+  filter(siRNA == "siNeg9") %>% 
+  select(gene, time, treatment, replicate, ctl_siNeg9 = percentage)
+
+siRNA_df <- data_df %>% 
+    # exclude siSMAD1, gene HNF4G rep a  
+  #filter(siRNA != "siSMAD1" | gene != "HNF4G" | replicate != "A") %>%
+  filter(gene != "GAPDH") %>%
+  drop_na() %>% 
+  bind_rows(extra_points) %>% 
+  filter(siRNA != "siNeg9")%>% 
+  select(siRNA, gene, time, treatment, replicate, percentage)
+
+data_df_combined <-  siRNA_df %>% 
+  left_join(ctl_df, by = join_by(gene, time, treatment, replicate)) %>% 
+  select(gene, siRNA, time, treatment, replicate, ctl_siNeg9, percentage)%>% 
+  melt()
+
+p4 <- data_df_combined %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  geom_hline(yintercept = 100) +
+  geom_point() +
+  geom_line(aes(linetype = variable)) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_grid(gene ~ siRNA) +
+  ylim(1, 1500)+
+  ggtitle("second set of siRNAs")+
+  cowplot::panel_border()
+
+p4 
+
+# save plots
+save_my_plot(plot = p4, name = "/qPCR_second_siRNAs_averages_bigger.png",30,10)
+
+```
+PROBLEM with 48h tp and huge values --> check!
+exclude siSMAD1, gene HNF4G rep a
+
+## Hit calling
+
+create df with t and p values 
+```{r}
+# perform t-test per time, per condition (treatment), per gene (target gene) for each siRNA vs siNeg9
+
+tt <- data_df_combined %>% 
+  select(siRNA, gene, time, value, treatment, variable)
+
+
+test_df <- tt %>% 
+  # remove GAPDH because not testable
+  filter(gene != "GAPDH") %>% 
+  # define groups for test (one test per group)
+  group_by(siRNA, gene, time, treatment) %>% 
+  # nest data to run test per group
+  nest(data = c(value, variable))%>%
+  mutate(t = purrr::map(data, 
+                          function(df) {
+                            # long to wide format
+                            df <- df %>% 
+                            mutate(rowID = rep(c(1:(nrow(df)/2)), 2)) %>% 
+                              dcast(rowID ~ variable, value.var = "value")
+                            # run test and extract t-value
+                            t <- as.numeric(t.test(df$percentage, df$ctl_siNeg9)$statistic[["t"]])
+                            
+                          }
+                          )) %>%
+  mutate(p = purrr::map(data, 
+                          function(df) {
+                            
+                            df <- df %>% 
+                            mutate(rowID = rep(c(1:(nrow(df)/2)), 2)) %>% 
+                              dcast(rowID ~ variable, value.var = "value")
+                            # run test and extract p-value
+                            p <- as.numeric(t.test(df$percentage, df$ctl_siNeg9)$p.value)
+                            
+                          }
+                          )) %>% 
+  select(-data) %>% 
+  unnest()
+```
+
+
+## Anova and Post hoc tests, including saving of tables
+
+```{r}
+p_time <- "96h"
+p_gene <- "IGFBP3"
+p_si <- "siFLI1"
+  
+example <- data_df %>% 
+  #mutate(sqrt_percentage = sqrt(percentage))%>% 
+  bind_rows(extra_points) %>% 
+   drop_na() %>% 
+  mutate(siRNA= factor(siRNA, levels = c( "siNeg9","siFLI1", "siE2F1","siSMAD1","siSMAD1_C" ))) %>% 
+  filter(gene == p_gene ) %>%
+  filter(siRNA %in% c("siNeg9", p_si)) %>% 
+  filter(time==p_time)
+
+a <- example %>% 
+  ggplot(aes(x=siRNA, y=percentage, color=treatment, shape= replicate))+
+  scale_color_manual(values = c("ctrl" = "#2BACC2", "TGF" = "#80146E"))+
+  stat_summary(aes(group = interaction(siRNA, treatment)),geom = "crossbar", fun= mean, color = "black", width = 0.4)+
+ # ggtitle("96h") +
+  ylab(paste0(p_gene, " mRNA levels (% of siNeg9 treated cells at 48h)")) +
+  geom_jitter(width=0.1)+
+  ylim(0,850)
+
+a
+save_my_plot(plot = a, 
+             name = paste0("p_qPCR_secondsiRNAs_", p_si, "_", p_gene, "_", p_time, "_", format(Sys.Date()), ".png"), 
+                           height = 6, width = 4)
+```
+
+Anova:
+```{r}
+aov(percentage ~ siRNA * treatment, data=example) %>% summary() 
+
+# to save anova table define file path and name
+full_path <- file.path(here("data/qPCR/processed_data"), paste0("anova_secondSetsiRNAs", p_si, "_", p_gene, "_", 
+                                                                p_time, "_", format(Sys.Date(), "%Y%m%d"), ".csv"))
+
+# save anova table
+aov(percentage ~ siRNA * treatment, data=example) %>% 
+  summary() %>% 
+  .[[1]] %>% 
+  data.frame() %>%
+  write.csv(., file = full_path, row.names = TRUE)
+
+```
+
+Post hoc test to check the significance of differences between which comparisons
+```{r}
+model <- aov(percentage ~ siRNA * treatment, data=example)
+
+tukey_r <- TukeyHSD(model)
+tukey_r
+
+# save post hoc table, define first directory and file name
+full_path <- file.path(here("data/qPCR/processed_data"), paste0("tukey_secondsiRNA_", p_si, "_", p_gene, "_", p_time, "_", format(Sys.Date()), ".csv"))
+
+c <- lapply(tukey_r, as.data.frame)%>%
+  bind_rows(.)
+
+lapply(tukey_r, as.data.frame) %>%
+  bind_rows(.) %>%
+  write.csv(., file = full_path, row.names = TRUE)
+```
+
+
+## 3.1 siSMAD1_b
+```{r}
+# restructure factor gene
+smad1_2 <- data_df_combined
+smad1_2$gene <- factor(smad1_2$gene, levels = c("SMAD1", "COL1A1", "ID2", "ID3", "HNF4G","NR4A1"))
+
+data_df_combined_smad1_2 <- smad1_2[order(smad1_2$gene), ]
+
+
+p_smad1_2 <- data_df_combined_smad1_2 %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  # only for SMAD1 KD, exclude COL1A2 as most of the CT values are above 30 
+  filter(siRNA == "siSMAD1", gene != "COL1A2") %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene, ncol = 3) +
+  ggtitle("siSMAD1_B")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+ # ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_smad1_2
+
+# save plot
+save_my_plot(plot = p_smad1_2, name = "/qPCR_second_siSMAD1_mean_2.png", 6.2, 7)
+
+```
+
+
+```{r}
+p_smad1_2 <- data_df_combined_smad1_2 %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  filter(gene %in% c("SMAD1", "COL1A1")) %>%
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  # only for SMAD1 KD, exclude COL1A2 as most of the CT values are above 30 
+  filter(siRNA == "siSMAD1", gene != "COL1A2") %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene, ncol = 3) +
+  ggtitle("siSMAD1_B")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+ # ylim(-10, 800)+
+  cowplot::panel_border()
+
+p_smad1_2
+
+```
+
+
+## 3.2 siSMAD1_C
+```{r}
+# restructure factor gene
+smad1_2 <- data_df_combined
+smad1_2$gene <- factor(smad1_2$gene, levels = c("SMAD1", "COL1A1", "ID2", "ID3", "HNF4G","NR4A1"))
+
+data_df_combined_smad1_2 <- smad1_2[order(smad1_2$gene), ]
+
+
+p_smad1_3 <- data_df_combined_smad1_2 %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  # only for SMAD1 KD, exclude COL1A2 as most of the CT values are above 30 
+  filter(siRNA == "siSMAD1_C", gene != "COL1A2" ) %>%#, gene %in% c("SMAD1","COL1A1")) %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene, ncol=3) +
+  ggtitle("siSMAD1_C")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+ # ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_smad1_3
+
+# save plot
+save_my_plot(plot = p_smad1_3, name = "/qPCR_third_siSMAD1_mean.png",6.2, 7)
+
+```
+
+## 3.3 siE2F1_b
+
+```{r}
+# restructure factor gene
+e2f1_2 <- data_df_combined
+e2f1_2$gene <- factor(e2f1_2$gene, levels = c("E2F1", "COL1A1", "SERPINE1", "ID2", "ID3", "HNF4G","SMAD1"))
+
+data_df_combined_e2f1_2 <- e2f1_2[order(e2f1_2$gene), ]
+
+
+p_e2f1_2 <- data_df_combined_e2f1_2 %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  # only for SMAD1 KD, exclude NR4A1 gene as there are outliers?
+  filter(siRNA == "siE2F1") %>%#, gene != "NR4A1") %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene, ncol= 5) +
+  ggtitle("siE2F1_b")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+ # ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_e2f1_2
+
+# save plot
+save_my_plot(plot = p_e2f1_2, name = "/qPCR_second_siE2F1_mean.png", 9, 11)
+
+```
+
+## 3.4 siFLI1_b
+
+```{r}
+# restructure factor gene
+fli1_2 <- data_df_combined
+fli1_2$gene <- factor(fli1_2$gene, levels = c("FLI1", "COL1A1", "IGFBP3", "ID2", "ID3", "E2F1", "HNF4G","SMAD1"))
+
+data_df_combined_fli1_2 <- fli1_2[order(fli1_2$gene), ]
+
+
+p_fli1_2 <- data_df_combined_fli1_2 %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  # only for SMAD1 KD, exclude NR4A1 gene as there are outliers?
+  filter(siRNA == "siFLI1") %>%#, gene != "NR4A1") %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_wrap(~gene, ncol=3) +
+  ggtitle("siFLI1_b")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+ # ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_fli1_2
+
+# save plot
+save_my_plot(plot = p_fli1_2, name = "/qPCR_second_siFLI1_mean.png", 9, 7)
+
+```
+
+
+## 3.5 siCOL1A1
+
+```{r}
+p_col <- data_df_combined %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  # only for SMAD1 KD, exclude NR4A1 gene as there are outliers?
+  filter(siRNA != "siFLI1", siRNA != "siE2F1", siRNA != "siSMAD1", siRNA != "siSMAD1_C") %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_grid(siRNA ~ gene) +
+  ggtitle("siCOL1A1")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+ # ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_col
+
+# save plot
+save_my_plot(plot = p_col, name = "/qPCR_siCOL1A1_mean.png", 9, 9)
+
+```
+
+```{r}
+p_col <- data_df_combined %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  # only for SMAD1 KD, exclude NR4A1 gene as there are outliers?
+  filter(siRNA != "siFLI1", siRNA != "siE2F1", siRNA != "siSMAD1", siRNA != "siSMAD1_C", gene != "E2F1", gene != "ID2",gene != "ID3", gene != "SMAD1",) %>%
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_grid(gene ~ siRNA) +
+  ggtitle("siCOL1A1")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+ # ylim(-10, 800)+
+  cowplot::panel_border()
+ 
+p_col
+
+# save plot
+save_my_plot(plot = p_col, name = "/qPCR_siCOL1A1_mean_Col1only.png", 9, 9)
+
+```
+
+
+## Heatmap second set of siRNAs
+First separate control and siNeg9 data frames:
+
+```{r}
+ctl_df <- data_df %>% 
+  filter(gene != "GAPDH") %>%
+  filter(time=="96h") %>% 
+  drop_na() %>% 
+  bind_rows(extra_points) %>% 
+  filter(siRNA == "siNeg9") %>% 
+  group_by(gene,time,treatment) %>% 
+  summarize(mean_siNeg9 = mean(percentage, na.rm=TRUE))
+
+siRNA_df <- data_df %>% 
+  filter(gene != "GAPDH") %>%
+  filter(time=="96h") %>% 
+  drop_na() %>% 
+  bind_rows(extra_points) %>% 
+  filter(siRNA != "siNeg9")%>% 
+  select(siRNA, gene, time, treatment, replicate, percentage) 
+
+```
+
+Calculate log fold changes in percentage between siRNA of interest and siNeg9:
+
+```{r}
+data_df_combined_s <-  siRNA_df %>% 
+  left_join(ctl_df) %>% 
+  mutate(corrected = log(percentage / mean_siNeg9)) %>% 
+  group_by(treatment,gene,siRNA) %>% 
+  summarize(mean_diff = mean(corrected,na.rm=TRUE)) %>% 
+  ungroup()
+
+```
+
+T-tests comparing the percentages between siRNA of interest and siNeg9:
+
+```{r}
+# extract levels to loop over
+genes <- siRNA_df$gene %>% unique()
+treatments <- siRNA_df$treatment %>% unique()
+siRNAs <- siRNA_df$siRNA %>%  unique()
+
+results <- data.frame(gene = NULL, treatment =NULL, siRNA = NULL, p=NULL)
+
+for(i in seq_along(genes)){
+  for(j in seq_along(treatments)){
+    for(k in seq_along(siRNAs)){
+      groupA <- siRNA_df %>% 
+        filter(gene == genes[i], treatment== treatments[j], siRNA == siRNAs[k]) %>% 
+        pull(percentage)
+      groupB <- data_df %>% 
+        filter(gene == genes[i], treatment== treatments[j], siRNA == "siNeg9", time=="96h") %>% 
+        pull(percentage)
+      pval <- ifelse((length(groupA)>0) & (length(groupB)>0), t.test(groupA, groupB)$p.value, NA)
+      #browser()
+      results <- results %>% 
+        bind_rows(data.frame(gene = genes[i], treatment = treatments[j], siRNA = siRNAs[k], p = pval))
+    }
+  }
+}
+
+# add p.values to combined df
+data_df_combined_s <- data_df_combined_s %>% 
+  left_join(results) %>% 
+   mutate(pstar = stars.pval(p))
+
+
+```
+
+Plot the results in a heatmap.
+
+```{r}
+data_df_combined_s$gene <- as.factor(data_df_combined_s$gene)
+data_df_combined_s$siRNA <- as.factor(data_df_combined_s$siRNA)
+
+# # plot and save as pdf
+# subfolder <- format(Sys.Date(), "%Y-%m-%d")
+# dir <- file.path(here("figures"), subfolder)
+# # print(dir)
+# 
+# if (!dir.exists(dir)) {
+#   dir.create(dir, recursive = TRUE)
+# }
+# 
+# pdf(file.path(dir, "heatmap_qPCR_siRNA2.pdf"), width = 8 , height = 4)
+# 
+# y <- data_df_combined_s %>% 
+#   mutate(yadj = ifelse(treatment == "ctrl", -0.4/2, 0.4/2 ),
+#          xpos = as.numeric(factor(gene)) ,
+#          ypos = as.numeric(factor(siRNA)) +yadj ) %>% 
+#   ggplot(aes(x=xpos, y=ypos, fill=mean_diff))+
+#   geom_tile(height=0.4, width=0.8, color="gray") +
+#   geom_text(aes(label = ifelse(!is.na(pstar), pstar, "")), show.legend = FALSE) +
+#   scale_fill_gradient2(labels = function(breaks) paste0(breaks, ""),
+#                        low = "#2BACC2", mid = "white", high = "#80146E") +
+#   scale_x_continuous(breaks = 1:12, name = "gene",
+#                      labels = levels(data_df_combined_s$gene)) +
+#   scale_y_continuous(breaks = 1:8, name = "siRNA",
+#                      labels = levels(data_df_combined_s$siRNA)) +
+#   theme_classic()+
+#   theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1))+
+#   labs(title="lower: ctrl, upper:TGFb_second set of siRNAs")+
+#   coord_fixed()+
+#   NULL
+# y
+# 
+# dev.off()
+
+
+# plot and save as pdf without siCOL1A1 and siFN1
+pdf(file.path(dir, "heatmap_qPCR_siRNA2.pdf"), width = 8 , height = 4)
+
+data_df_combined_s$gene <- as.factor(data_df_combined_s$gene)
+data_df_combined_s$siRNA <- as.factor(data_df_combined_s$siRNA)
+
+data_df_combined_s <- data_df_combined_s %>% 
+  #filter(!(siRNA %in% c("siCOL1A1_75", "siCOL1A1_76", "siCOL1A1_77", "siFN1")))%>% 
+  filter(siRNA %in% c("siSMAD1", "siSMAD1_C", "siE2F1", "siFLI1"))
+
+
+z <- data_df_combined_s %>% 
+  mutate(yadj = ifelse(treatment == "ctrl", -0.4/2, 0.4/2 ),
+         xpos = as.numeric(factor(gene)) ,
+         ypos = as.numeric(factor(siRNA)) +yadj ) %>% 
+  ggplot(aes(x=xpos, y=ypos, fill=mean_diff))+
+  geom_tile(height=0.4, width=0.8, color="gray") +
+  geom_text(aes(label = ifelse(!is.na(pstar), pstar, "")), show.legend = FALSE) +
+  scale_fill_gradient2(labels = function(breaks) paste0(breaks, ""),
+                       low = "#2BACC2", mid = "white", high = "#80146E") +
+  scale_x_continuous(breaks = 1:11, name = "gene",
+                     labels = levels(data_df_combined_s$gene)) +
+  scale_y_continuous(breaks = 1:4, name = "siRNA",
+                     labels = levels(data_df_combined_s$siRNA)) +
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1))+
+  labs(title="lower: ctrl, upper:TGFb_second set of siRNAs")+
+  coord_fixed()+
+  NULL
+z
+
+dev.off()
+
+```
+
+
+```{r}
+png("C:/Users/tuechler/Documents/EMBL_PhD/liverfibrosis/figures/heatmap_qPCR_siRNA2.png", width = 3200 , height = 2100, res = 400)
+
+data_df_combined_s %>% 
+  mutate(yadj = ifelse(treatment == "ctrl", -0.4/2, 0.4/2 ),
+         xpos = as.numeric(factor(gene)) ,
+         ypos = as.numeric(factor(siRNA)) +yadj ) %>% 
+  ggplot(aes(x=xpos, y=ypos, fill=mean_diff))+
+  geom_tile(height=0.4, width=0.8, color="gray") +
+  geom_text(aes(label = pstar), show.legend = FALSE)+
+  scale_fill_gradient2(labels = function(breaks) paste0(breaks, ""),
+                       low = "#2BACC2", mid = "white", high = "#80146E") +
+  scale_x_continuous(breaks = 1:11, name = "gene",
+                     labels = levels(data_df_combined_s$gene)) +
+  scale_y_continuous(breaks = 1:7, name = "siRNA",
+                     labels = levels(data_df_combined_s$siRNA)) +
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1))+
+  labs(title="lower: ctrl, upper:TGFb")+
+  coord_fixed()+
+  NULL
+
+dev.off()
+
+
+```
+
+## combine maps
+```{r}
+ggplot2::ggsave(filename = paste0(plotdir,
+                                  Sys.Date(), "_", "qPCR_heatmap_combined.pdf"),
+                plot = x / z, 
+                width = 10, height = 9)
+```
+
+# 5. FN1 excluded NT23_010!
+```{r}
+data_df <- data_fn1 
+
+extra_points <- data_df %>% 
+  filter(gene != "GAPDH") %>%
+  filter(treatment == "ctrl", time == "48h") %>% 
+  mutate(treatment = "TGF") %>% 
+  # filter(treatment == "ctrl" & time == "48h") %>% 
+  # mutate(time = "48h", treatment = "TGF") %>% 
+  distinct(time, percentage, replicate, treatment, gene, siRNA) 
+
+p7 <- data_df %>% 
+  drop_na() %>% 
+  filter(gene != "GAPDH") %>%
+  bind_rows(extra_points)%>% 
+  mutate(group = paste(gene, replicate, treatment, sep = "_")) %>% 
+  ggplot(aes(x = time, y = percentage, shape = replicate, colour = treatment, group = group)) +
+  geom_hline(yintercept = 100) +
+  geom_point() +
+  geom_line() +
+  facet_grid(gene ~siRNA) +
+  ggtitle("FN1 KD")+
+  ylab("mRNA levels (% of siNeg9 treated cells at 48h)") +
+  cowplot::panel_border()
+
+p7
+
+# save plots
+save_my_plot(plot = p7, name = "/qPCR_siFN1.png", 6, 18)
+```
+
+## new
+
+```{r}
+ctl_df <- data_df %>% 
+  filter(gene != "GAPDH") %>%
+  drop_na() %>% 
+  bind_rows(extra_points) %>% 
+  filter(siRNA == "siNeg9") %>% 
+  select(gene, time, treatment, replicate, ctl_siNeg9 = percentage)
+
+siRNA_df <- data_df %>% 
+  filter(gene != "GAPDH") %>%
+  drop_na() %>% 
+  bind_rows(extra_points) %>% 
+  filter(siRNA != "siNeg9")%>% 
+  select(siRNA, gene, time, treatment, replicate, percentage)
+
+data_df_combined <-  siRNA_df %>% 
+  left_join(ctl_df, by = join_by(gene, time, treatment, replicate)) %>% 
+  select(gene, siRNA, time, treatment, replicate, ctl_siNeg9, percentage)%>% 
+  melt()
+
+# restructure factor gene
+fn1 <- data_df_combined
+fn1$gene <- factor(fn1$gene, levels = c("FN1", "COL1A1", "SMAD1"))
+
+data_df_combined_fn1 <- fn1[order(fn1$gene), ]
+
+# plot
+p8 <- data_df_combined_fn1 %>% 
+  group_by(siRNA, time, treatment, variable, gene) %>% 
+  summarise(mean = mean(value, na.rm = T), sd =  sd(value, na.rm = T)) %>% 
+  mutate(group = paste(variable, treatment, sep = "_"))%>% 
+  ggplot(aes(x = time, 
+             y = mean, 
+             colour = treatment, 
+             group = group, 
+             shape = variable)) +
+  scale_color_manual(values = c("ctrl" = "#2BACC2",
+                                "TGF" = "#80146E"))+
+  geom_hline(yintercept = 100) +
+  geom_point(size=2) +
+  geom_line(aes(linetype = variable), size = 1) +
+  scale_linetype_manual(values = c("ctl_siNeg9" = "dashed", "percentage" = "solid")) +
+  geom_errorbar(aes(ymin=mean-sd, ymax=mean+sd), colour = "black", width=.2)+
+  facet_grid(~gene) +
+  ggtitle("FN1 KD")+
+  cowplot::panel_border()
+
+p8
+
+# save plots
+save_my_plot(plot = p8, name = "/qPCR_siFN1_averages.png", 4, 7)
+```
+
+## Hit calling
+
+create df with t and p values 
+```{r}
+# perform t-test per time, per condition (treatment), per gene (target gene) for each siRNA vs siNeg9
+
+tt <- data_df_combined %>% 
+  select(siRNA, gene, time, value, treatment, variable)
+
+
+test_df <- tt %>% 
+  # remove GAPDH because not testable
+  filter(gene != "GAPDH") %>% 
+  # define groups for test (one test per group)
+  group_by(siRNA, gene, time, treatment) %>% 
+  # nest data to run test per group
+  nest(data = c(value, variable))%>%
+  mutate(t = purrr::map(data, 
+                          function(df) {
+                            # long to wide format
+                            df <- df %>% 
+                            mutate(rowID = rep(c(1:(nrow(df)/2)), 2)) %>% 
+                              dcast(rowID ~ variable, value.var = "value")
+                            # run test and extract t-value
+                            t <- as.numeric(t.test(df$percentage, df$ctl_siNeg9)$statistic[["t"]])
+                            
+                          }
+                          )) %>%
+  mutate(p = purrr::map(data, 
+                          function(df) {
+                            
+                            df <- df %>% 
+                            mutate(rowID = rep(c(1:(nrow(df)/2)), 2)) %>% 
+                              dcast(rowID ~ variable, value.var = "value")
+                            # run test and extract p-value
+                            p <- as.numeric(t.test(df$percentage, df$ctl_siNeg9)$p.value)
+                            
+                          }
+                          )) %>% 
+  select(-data) %>% 
+  unnest()
+```
+
+###Anova COL1
+```{r}
+p_time <- "96h"
+p_gene <- "COL1A1"
+p_si <- "siFN1"
+  
+example <- data_df %>% 
+  bind_rows(extra_points) %>% 
+   drop_na() %>% 
+  filter(gene == p_gene ) %>%
+  filter(siRNA %in% c("siNeg9", p_si)) %>% 
+  filter(time==p_time)
+
+a <- example %>% 
+  ggplot(aes(x=siRNA, y=percentage, color=treatment, shape= replicate))+
+  scale_color_manual(values = c("ctrl" = "#2BACC2", "TGF" = "#80146E"))+
+  stat_summary(aes(group = interaction(siRNA, treatment)),geom = "crossbar", fun= mean, color = "black", width = 0.4)+
+  ggtitle("96h") +
+  ylab(paste0(p_gene, " mRNA levels (% of siNeg9 treated cells at 48h)")) +
+  geom_jitter(width=0.1)+
+  ylim(0,1050)
+
+a
+
+# save plot
+save_my_plot(plot = a +
+                theme(axis.title = element_text(size = 14),
+                                     legend.title = element_text(size = 14),
+                                     legend.text = element_text(size = 12),
+                                     axis.text = element_text(size = 12), 
+                                    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)), 
+                     name = paste0("/qPCR_second_points_", p_si, p_gene, ".png"), 6, 4)
+
+```
+
+
+```{r}
+aov(percentage ~ siRNA * treatment, data=example) %>% summary() 
+ #lm(percentage ~ siRNA * treatment, data=example) %>% summary()
+```
+

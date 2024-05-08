@@ -1,0 +1,553 @@
+---
+title: "Col I/CNA35 staining_image analyis_initial steps"
+author: "Nadine Tuechler"
+date: "**Date**: `r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+This script was generated with help from Denes Turei and Sarah Kaspar
+
+# Data
+
+- Count_NucleiAll: indicates the nuclei (cell) number per image  
+- Col1_bg_corrected
+    - We want to measure the Collagen 1 deposition that is by treating with TGF  
+    - Background of the cover slip is already subtracted with: Col1_bg_corrected = Intensity_TotalIntensity_Col1 - (MEAN_background * TOTAL_AREA)  
+    - MEAN_background is 200/2^16  
+    - TOTAL_AREA = 4665600 (pixel number)  
+    - No autofluorescence correction yet (this is what we use the condition “unstained” for)  
+
+- plate: biological replicate, 24-well plate  
+- well: wells within the plate  
+- position: position within a well (36 positions per well)  
+- time: 0h, 12h, 24h, 48h, 72h, 96h  
+    - Time of treatment with TGF or the ctrl  
+    - 0h ctrl is NOT like the other controls  
+- condition: ctrl, TGF, unstained  
+- replicates: technical replicates on a plate  
+
+
+# 1. Load libraries and data
+```{r load libraries}
+#BiocManager::install("dplyr")
+
+#load libraries
+library(tidyverse)
+library(fitdistrplus)
+library(vcd)
+library(readr)
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(tidyr)
+```
+
+```{r parameters}
+PARAM <- list()
+PARAM$folder <- paste0(getwd(), "/")
+PARAM$folder.R <- gsub("code/", "",PARAM$folder)
+PARAM$folder.output <- paste0(PARAM$folder.R, "output/")
+PARAM$folder.figures <- paste0(PARAM$folder.R, "figures/linear_model/")
+PARAM$folder.data <- paste0(PARAM$folder.R, "data/")
+
+```
+
+```{r import data and get rid of unnecessary rows}
+import_files <- function(filename){
+  df <-   file.path(PARAM$folder.data, filename) %>% 
+  {suppressWarnings(readLines(.))} %>%
+  {c(.[1], stringr::str_subset(., '^\\d'))} %>%
+  paste(collapse = '\n') %>%
+  readr::read_csv(col_types = readr::cols())
+}
+
+df_A <- import_files(filename = 'NT22_004_A_20240127.csv')
+df_B <- import_files(filename = 'NT22_004_B_20240127.csv')
+df_C <- import_files(filename = "NT22_004_C_20240127.csv")
+df_D <- import_files(filename = "NT22_004_D_20240127.csv")
+
+
+plotdir <- PARAM$folder.figures <- paste0(PARAM$folder.R, "figures/linear_model/")
+```
+
+
+# 2. Optimize dataframe
+extract information like well name and position
+```{r df extract well name and position}
+# rep A
+df_A %<>%
+  tidyr::extract(
+    FileName_Collagen,
+    c('well', 'position'),
+    'Col1-A--(\\w\\d)[\\w\\d-]+(P\\d+)'
+  )
+df_A$plate <- "A"
+
+# rep 
+df_B %<>%
+  tidyr::extract(
+    FileName_Collagen,
+    c('well', 'position'),
+    'Col1-B--(\\w\\d)[\\w\\d-]+(P\\d+)'
+  )
+df_B$plate <- "B"
+
+# rep C of NT23_012
+df_C %<>%
+  tidyr::extract(
+    FileName_Collagen,
+    c('well', 'position'),
+    'Col1-C--(\\w\\d)[\\w\\d-]+(P\\d+)'
+  )
+df_C$plate <- "C"
+
+# rep D
+df_D %<>%
+  tidyr::extract(
+    FileName_Collagen,
+    c('well', 'position'),
+    'Col1-D--(\\w\\d)[\\w\\d-]+(P\\d+)'
+  )
+df_D$plate <- "D"
+```
+
+
+# 3. Add treatments --> new dataframe 
+```{r df define treatments}
+# treatment dfs
+treatments_A <-
+  file.path(PARAM$folder.data, 'NT22_004_treatments_A.csv') %>%
+  readr::read_csv(col_types = readr::cols())
+
+treatments <-
+  file.path(PARAM$folder.data, 'NT22_004_treatments.csv') %>%
+  readr::read_csv(col_types = readr::cols())
+```
+
+get separate column with treatments
+```{r df include treatments}
+# first set of siRNAs
+df_A %<>%
+  dplyr::inner_join(treatments_A, by = 'well') %>%
+  tidyr::separate(., treatments, c('time', 'condition'), fill = 'left')
+
+df_B %<>%
+  dplyr::inner_join(treatments, by = 'well') %>%
+  tidyr::separate(., treatments, c('time', 'condition'), fill = 'left')
+
+df_C %<>%
+  dplyr::inner_join(treatments, by = 'well') %>%
+  tidyr::separate(., treatments, c('time', 'condition'), fill = 'left')
+
+df_D %<>%
+  dplyr::inner_join(treatments, by = 'well') %>%
+  tidyr::separate(., treatments, c('time', 'condition'), fill = 'left')
+
+```
+
+# 4. multiply values wit 65535 
+to have the same values that are shown in image J
+```{r}
+# multiply with 65535 
+# write function to multiply values with 65535 (as shown in image J)
+
+multiply65535 <- function(df){df %>% 
+  dplyr::mutate(Intensity_TotalIntensity_Collagen_x65535 = Intensity_TotalIntensity_Collagen * 65535)}
+
+# multiply 
+
+df_65535_A <- multiply65535(df_A)
+df_65535_B <- multiply65535(df_B)
+df_65535_C <- multiply65535(df_C) 
+df_65535_D <- multiply65535(df_D)
+
+```
+
+
+# 5. Background subtraction
+## function bg_subtract
+```{r}
+# write function to subtract background and unspecific antibody staining
+bg_subtract <- function(df, MEAN_BG_65535, MEAN_BG_ABunspecific){
+  
+  # total area of image 
+  TOTAL_AREA <- 4665600 
+
+  # cover slip background subtraction
+  df %>%
+    dplyr::mutate(
+      Col1_bg_corrected_65535 = Intensity_TotalIntensity_Collagen_x65535 - (MEAN_BG_65535 * TOTAL_AREA)) %>%
+
+  # unspecific antibody staining background subtraction 
+  # (not for unstained control as there is no primary antibody)
+   dplyr::mutate(
+      Col1_bg_and_unspecificAB_corrected_65535 = ifelse(condition !="unstained",
+        Col1_bg_corrected_65535 - ((MEAN_BG_ABunspecific * (TOTAL_AREA - (0 * Count_Nuclei)))), #if
+        Col1_bg_corrected_65535) #else
+      ) %>%
+  
+    # normalize to nuclei number 
+    dplyr::mutate(intensity_diff_nNuclei_65535 = Col1_bg_and_unspecificAB_corrected_65535 / Count_Nuclei)
+
+  #%>%
+   #dplyr::mutate(cell_free_area = TOTAL_AREA - (0 * Count_Nuclei))
+     #    Col1_bg_corrected_65535_2 = Col1_bg_corrected_65535 - (MEAN_BG_ABunspecific * TOTAL_AREA))
+
+}
+
+```
+
+
+### subtract backgrounds
+```{r}
+df_65535_new_A <- bg_subtract(df_65535_A, MEAN_BG_65535 = 220, MEAN_BG_ABunspecific = 50)
+df_65535_new_B <- bg_subtract(df_65535_B, MEAN_BG_65535 = 220, MEAN_BG_ABunspecific = 55)
+df_65535_new_C <- bg_subtract(df_65535_C, MEAN_BG_65535 = 234, MEAN_BG_ABunspecific = 65)
+df_65535_new_D <- bg_subtract(df_65535_D, MEAN_BG_65535 = 232, MEAN_BG_ABunspecific = 80)
+
+```
+
+
+example to check background subtraction of unstained control
+```{r}
+plot_Col1_corr_per_cell_unstained_A <-
+  ggplot(data = df_65535_new_A %>% 
+           filter(condition == "unstained"),
+         aes(x = Count_Nuclei, y = intensity_diff_nNuclei_65535, colour = condition, shape = replicates)) + # y = Col1_per_cell
+  geom_point() + 
+#  facet_wrap( ~ time) +
+  xlim(0,450)+
+  ggtitle("Col1 (BG,AF) corrected per cell - plate A") #+
+#  ylim(-5000000,15000000)
+  
+plot_Col1_corr_per_cell_unstained_A
+```
+
+
+## 6. Auto-fluorescence correction 
+### Mean Auto-fluorescence (unstained) intensity per nucleus
+function for auto-fluorescence correction
+```{r}
+AF_correction <- function(df){
+  df %<>%
+    # calculate fluorescence per cell
+    filter(condition == "unstained") %>%
+    subset(Count_Nuclei > 20) %>%
+
+   dplyr::mutate(AFcell = mean(intensity_diff_nNuclei_65535))
+}
+
+```
+
+
+function for auto-fluorescence subtraction 
+```{r}
+## Normalize to nuclei number and subtract autofluorescence per cell 
+AF_subtraction <- function(df_first_AF, df_second){
+    
+    # auto-fluorescence signal
+    AF_per_cell <- unique(df_first_AF$AFcell) 
+  
+    # norm to nuclei and subtract AF
+    df_second %<>%
+      filter(condition != "unstained") %>%
+ 
+    # subtract auto-fluorescence signal per cell
+    mutate(Col1_per_cell = intensity_diff_nNuclei_65535 - AF_per_cell)
+
+}
+
+```
+
+```{r}
+# calculate autofluorescence signal 
+df_A_AF <- AF_correction(df_65535_new_A)
+df_B_AF <- AF_correction(df_65535_new_B)
+df_C_AF <- AF_correction(df_65535_new_C)
+df_D_AF <- AF_correction(df_65535_new_D)
+
+# subtract autofluorescence per cell
+#df_A12_final <- AF_subtraction(df_first_AF = df_A12_AF, df_second = df_65535_A)
+df_A_final <- AF_subtraction(df_A_AF, df_65535_new_A)
+df_B_final <- AF_subtraction(df_B_AF, df_65535_new_B)
+df_C_final <- AF_subtraction(df_C_AF, df_65535_new_C)
+df_D_final <- AF_subtraction(df_D_AF, df_65535_new_D)
+
+```
+
+
+```{r}
+plot_Col1_corr_per_cell_AA <-
+  ggplot(data = df_A_final, 
+         aes(x = Count_Nuclei, y = Col1_per_cell, colour = condition, shape = replicates)) + # y = Col1_per_cell
+  geom_point() + 
+  facet_wrap( ~ time) +
+  #xlim(0,450)+
+  ggtitle("Col1 (BG,AF) corrected per cell - plate A") # +
+#  ylim(-5000000,150000000)
+  
+plot_Col1_corr_per_cell_AA
+```
+
+two outliers at 48h  --> remove values above 1.2e+07 (but should be gone with >20 nuclei filter 
+
+```{r}
+# show which ones are the outlier images 
+outlier <- which(df_A_final$Count_Nuclei < 20) # & 
+                    #df$Count_NucleiAll<350 )#returns number of lines to be selected
+df_outliers <- df_A_final[outlier , ]
+
+
+# df with data that do not include the outliers
+outlier_ex <- which(df_A_final$Count_Nuclei > 20) # & 
+                    #df$Count_NucleiAll<350 )#returns number of lines to be selected
+df_outliersEX <- df_A_final[outlier_ex , ]
+#data <- df_outliersEX
+```
+
+```{r}
+plot_Col1_corr_per_cell_A <-
+  ggplot(data = df_outliersEX, 
+         aes(x = Count_Nuclei, y = Col1_per_cell, colour = condition, shape = replicates)) +
+  scale_color_manual(values = c("#424242", "#757575")) +
+  geom_point(alpha = 0.6) + 
+  facet_wrap( ~ time) +
+  xlim(0,450)+
+  ggtitle("Col1 (BG,AF) corrected per cell - plate A") +
+  ylim(-500000,12000000)
+  
+plot_Col1_corr_per_cell_A
+```
+
+does collagen deposition increase over time in ctrl?? -- might have to adjust background correction 
+
+
+
+# 7. Create full df with all replicates
+```{r create full df}
+data <- rbind(df_A, df_B, df_C, df_D)
+#data %<>% filter(siRNA != "NA")
+dim(data)
+```
+
+
+```{r}
+plot_Col1_corr_per_cell_all <-
+  ggplot(data = data, # %>%
+           #subset(Count_Nuclei >20),
+         aes(x = Count_Nuclei, y = Col1_per_cell, colour = condition, shape = replicates)) + 
+  scale_color_manual(values = c("#424242", "#757575")) +
+  geom_point(alpha = 0.6) + 
+  facet_grid(plate ~ time) +
+  xlim(0,450)+
+  ggtitle("Col1 (BG,AF) corrected per cell - all") #+
+  ylim(-5000000,150000000)
+  
+plot_Col1_corr_per_cell_all
+```
+
+
+## exclude images with less than e.g. 20 nuclei 
+
+```{r}
+# show which ones are the outlier images 
+outlier <- which(data$Count_Nuclei < 20, data$Col1_per_cell > 12000000) # & 
+                    #df$Count_NucleiAll<350 )#returns number of lines to be selected
+df_outliers <- data[outlier , ]
+
+
+# df with data that do not include the outliers
+outlier_ex <- which(data$Count_Nuclei > 20)
+                    #df$Count_NucleiAll<350 )#returns number of lines to be selected
+df_outliersEX <- data[outlier_ex , ]
+#data <- df_outliersEX
+```
+
+```{r}
+plot_Col1_corr_per_cell_all <-
+  ggplot(data = df_outliersEX,
+         aes(x = Count_Nuclei, y = Col1_per_cell, colour = condition)) + # y = Col1_per_cell
+    scale_color_manual(values = c("ctrl" = "#4F87BF", 
+                                "TGF" = "#80146E")) +
+  geom_point(alpha = 0.6, size= 0.8) +
+  facet_grid(plate ~ time) +
+  xlim(0,450)+
+  ggtitle("Col I (BG,AF) corrected per cell - Count_Nuclei > 20") +
+  ylim(-500000,30000000)+
+  theme_bw()
+  
+plot_Col1_corr_per_cell_all
+
+ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
+                                  Sys.Date(), "_", "NT22_004_all.png"),
+                plot = plot_Col1_corr_per_cell_all +
+                  theme(axis.text = element_text(size = 9),
+                        axis.text.x = element_text(size=9, angle = 45, vjust = 1, hjust = 1),
+                        strip.text = element_text(size = 11),
+                        axis.title = element_text(size = 11),
+                        legend.text = element_text(size = 9),  # Adjust size of legend text
+                        legend.title = element_text(size = 11)),
+                width = 8, height = 5)
+```
+
+# save data
+```{r}
+dir.create('output', showWarnings = FALSE)
+
+
+df_outliersEXnew <- subset(df_outliersEX, select=-c(Metadata_FileLocation))
+
+file.path('output', 'NT22_004_Col1_20240127.csv') %>%
+readr::write_csv(file = ., df_outliersEXnew)
+```
+
+to find images to show in the thesis 
+```{r}
+# means <- df_outliersEXnew %>%
+#   group_by(plate, time, condition) %>%
+#   summarise(mean = mean(Col1_per_cell))
+```
+
+
+
+# 8. Calculate ratios
+ratio of TGF vs ctrl 
+
+## ratio ctrl vs TGF
+
+create df with intensity_norm_nuclei number values for each TGF treated sample
+```{r}
+ctrl_df <- df_outliersEXnew %>%
+  filter(condition == "ctrl") %>%
+  group_by(plate, time) %>%
+  summarise(ctrl_mean_intensity = mean(Col1_per_cell))
+```
+
+### ratio TGF
+```{r}
+df_ratio <- df_outliersEXnew %>%
+  #filter(condition == "TGF") %>%
+  left_join(ctrl_df, by = c("plate", "time")) %>%
+  mutate(FC_intensity = Col1_per_cell / ctrl_mean_intensity) %>%
+  group_by(time, condition)%>%
+  mutate(mean_FC = mean(FC_intensity))
+
+```
+
+#### plot
+```{r}
+# p_test <- df_ratio %>%
+#  #filter(condition == "TGF") %>%
+#   ggplot(aes(x = condition, y = FC_intensity)) +
+#   stat_summary(geom = "crossbar", fun= median, color = "black")+
+#   ggpubr::stat_compare_means(ref.group = "ctrl", label = "..p.signif..", method = 't.test',hide.ns = T, size = 5, label.y = 4.8, show.legend = F)+# wilcoxon
+#   ggforce::geom_sina(aes(color = condition, shape = plate),size = 0.8, alpha = 0.6)+
+#     scale_color_manual(values = c("ctrl" = "#4F87BF", 
+#                                 "TGF" = "#80146E")) +  facet_wrap(~time)+
+#   geom_hline(yintercept = 1, color = "gray26", linetype = "longdash") + #C0C0C0 708090 B2BEB5, B0C4DE
+#   ggtitle("FC = Col1_per_cell_TGF / mean_intensity_ctrl") +
+#   #ylim(0,5)+
+#   theme_bw()
+#   
+# p_test
+# 
+# ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
+#                                   Sys.Date(), "_", "NT22_004_TGFvsctrl.pdf"),
+#                 plot = p_test +
+#                   theme(strip.text = element_text(size = 10)),#+
+#                   #theme(axis.text = element_text(size = 11)),
+#                 width = 7, height = 5)
+```
+
+## ratio ctrl vs TGF
+
+```{r}
+df_ratio_2 <- df_outliersEXnew %>%
+  #filter(condition == "TGF") %>%
+  left_join(ctrl_df, by = c("plate", "time")) %>%
+  mutate(FC_intensity_2 = (Col1_per_cell - ctrl_mean_intensity) / ctrl_mean_intensity)
+
+```
+
+#### plot
+```{r}
+p_test_2 <- df_ratio_2 %>%
+ #filter(condition == "TGF") %>%
+  ggplot(aes(x = condition, y = FC_intensity_2)) +
+  stat_summary(geom = "crossbar", fun= median, color = "black")+
+  ggpubr::stat_compare_means(ref.group = "ctrl", label = "..p.signif..", method = 't.test')+# wilcoxon
+  ggforce::geom_sina(aes(color = condition, shape = plate),size = 0.8, alpha = 0.6)+
+  scale_color_manual(values = c("#424242","#9E9E9E")) +#, #008B8Bggforce
+                                # "A" = "#80146E", #2F4F4F
+                                # "B" = "#7958AC", #00CED1
+                                # "C" = "#2BACCA"
+ # geom_jitter(aes(color = plate),size = 1, width = 0.25, alpha = 0.6)+
+  facet_wrap(~time)+
+  geom_hline(yintercept = 0, color = "gray26", linetype = "longdash") + #C0C0C0 708090 B2BEB5, B0C4DE
+  ggtitle("LogFC TGF vs ctrl per time") +
+  #ylim(0,5)+
+  theme_bw()
+  
+p_test_2
+
+ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
+                                  Sys.Date(), "_", "NT22_004_TGFvsctrl_2.pdf"),
+                plot = p_test_2 ,#+
+                  #theme(axis.text = element_text(size = 11)),
+                width = 7, height = 5)
+```
+
+# compare to 0h
+
+create df with intensity_norm_nuclei number values for each TGF treated sample
+```{r}
+ctrl_df_0h <- df_outliersEXnew %>%
+  filter(condition == "ctrl" & time == "0h") %>%
+  group_by(plate) %>%
+  summarise(mean_intensity_0h = mean(Col1_per_cell))
+```
+
+### ratio TGF
+```{r}
+df_ratio_0h <- df_outliersEXnew %>%
+  #filter(condition == "TGF") %>%
+  left_join(ctrl_df_0h, by = c("plate")) %>%
+  mutate(FC_intensity_0h = (Col1_per_cell - mean_intensity_0h) / mean_intensity_0h)%>%
+  group_by(time, condition)%>%
+  mutate(mean_FC = mean(FC_intensity_0h))
+
+```
+
+#### plot
+```{r}
+p_test_0h <- df_ratio_0h %>%
+ #filter(condition == "TGF") %>%
+  ggplot(aes(x = condition, y = FC_intensity_0h)) +
+  stat_summary(geom = "crossbar", fun= median, color = "black")+
+  ggpubr::stat_compare_means(ref.group = "ctrl", label = "..p.signif..", method = 't.test', hide.ns = T, size = 5, label.y = 7.8, show.legend = F)+# wilcoxon
+  ggforce::geom_sina(aes(color = condition, shape = plate),size = 0.8, alpha = 0.6)+
+  scale_color_manual(values = c("ctrl" = "#424242", 
+                                "TGF" = "#9E9E9E")) +  facet_wrap(~time)+
+  facet_wrap(~time)+
+  geom_hline(yintercept = 0, color = "gray26", linetype = "longdash") + #C0C0C0 708090 B2BEB5, B0C4DE
+  ggtitle("FC = (Col1_per_cell - mean_intensity_0h) / mean_intensity_0h") +
+  ylim(-1.5,8.5)+
+  theme_bw()
+  
+p_test_0h
+
+ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
+                                  Sys.Date(), "_", "NT22_004_TGFvsctrl0h.png"),
+                plot = p_test_0h +
+                  theme(strip.text = element_text(size = 10)),#+
+                  #theme(axis.text = element_text(size = 11)),
+                width = 7, height = 5)
+```
+
+
+

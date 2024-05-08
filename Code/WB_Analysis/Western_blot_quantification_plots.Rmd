@@ -1,0 +1,263 @@
+---
+title: "NT23_006_CNA35_analyis_initial steps"
+author: "Nadine Tuechler"
+date: "**Date**: `r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+This script was generated with help from Denes Turei and Sarah Kaspar
+
+# Data
+
+- Count_NucleiAll: indicates the nuclei (cell) number per image  
+- Col1_bg_corrected
+    - We want to measure the Collagen 1 deposition that is by treating with TGF  
+    - Background of the cover slip is already subtracted with: Col1_bg_corrected = Intensity_TotalIntensity_Col1 - (MEAN_background * TOTAL_AREA)  
+    - MEAN_background is 200/2^16  
+    - TOTAL_AREA = 4665600 (pixel number)  
+    - No autofluorescence correction yet (this is what we use the condition “unstained” for)  
+
+- plate: biological replicate, 24-well plate  
+- well: wells within the plate  
+- position: position within a well (36 positions per well)  
+- time: 0h, 12h, 24h, 48h, 72h, 96h  
+    - Time of treatment with TGF or the ctrl  
+    - 0h ctrl is NOT like the other controls  
+- condition: ctrl, TGF, unstained  
+- replicates: technical replicates on a plate  
+
+
+# 1. Load libraries and data
+```{r load libraries}
+#BiocManager::install("dplyr")
+
+#load libraries
+library(tidyverse)
+library(fitdistrplus)
+library(vcd)
+library(readr)
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(tidyr)
+```
+
+```{r parameters}
+PARAM <- list()
+PARAM$folder <- paste0(getwd(), "/")
+PARAM$folder.R <- gsub("code/", "",PARAM$folder)
+PARAM$folder.output <- paste0(PARAM$folder.R, "output/")
+PARAM$folder.figures <- paste0(PARAM$folder.R, "figures/WB/")
+PARAM$folder.data <- paste0(PARAM$folder.R, "data/")
+
+# load data
+#data = read.csv(paste0(PARAM$folder.data,"yourfile")) # change accordingly
+```
+
+
+# WB pSMAD2
+```{r}
+df_WB <- read_csv('data/NT21_059_WB_quantification_22092021_.csv') # 48h rep A
+```
+
+## restructure factor sample
+```{r}
+# restructure factor sample
+df_WB$sample <- factor(df_WB$sample, levels = c( "siNeg9 25pmol", "siSMAD2 25pmol", "siNeg9 50pmol", "siSMAD2 50pmol","empty"))
+
+df_WB <- df_WB[order(df_WB$sample), ]
+```
+
+## plot
+```{r}
+p_wb <- df_WB %>%
+  ggplot(aes(x = sample, y = change, fill =sample )) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3)+ 
+  scale_fill_manual(values = c("empty" = "black",
+                                "siNeg9 25pmol" = "#737373",
+                                "siNeg9 50pmol" = "#737373",
+                                "siSMAD2 25pmol" = "lightgrey",
+                                "siSMAD2 50pmol" = "lightgrey"))+ 
+  ggtitle("phosphorylated SMAD2 vs SMAD2")+
+  facet_wrap(~time)+
+  theme_bw()+
+  geom_hline(yintercept = 1, color = "gray26", linetype = "longdash")+
+  ylab("(pSMAD2/a-tub)/(SMAD2/a-tub)")
+
+  
+p_wb
+
+ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
+                                  Sys.Date(), "_", "NT21_WB_2order.png"),
+                plot = p_wb+
+                  theme(axis.text = element_text(size = 14),
+                        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 12),
+                        legend.text = element_text(size = 10),
+                        strip.text = element_text( size = 12),
+                        axis.text.y = element_text(size = 12))+
+                  guides(fill = guide_legend(override.aes = list(size = 0.5))),
+                width = 8, height = 4.5)
+```
+
+
+# time points 1
+(experiment NT21_048)
+```{r}
+df_WB_48 <- read_csv("data/NT21_048_WB.csv")
+```
+```{r}
+p_wb2 <- df_WB_48 %>%
+  ggplot(aes(x = treatment, y = change, fill =treatment )) +
+  geom_bar(stat = "identity", color="black", linewidth = 0.3)+ #
+  scale_fill_manual(values = c("ctrl" = "black",#2F4F4F
+                                "TGF" = "#737373", "ctrl w/o phenol"="lightgrey", "TGF w/o phenol"="lightgrey"))+ 
+  ##424242", "#757575" ,"lightgrey
+  ggtitle("phosphorylated SMAD2 norm to SMAD2")+
+  facet_wrap(~time)+
+  theme_bw()+
+  geom_hline(yintercept = 1, color = "gray26", linetype = "longdash")  #C0C0C0 708090 B2BEB5, B0C4D
+  
+p_wb2
+
+ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
+                                  Sys.Date(), "_", "NT21_048_WB_.pdf"),
+                plot = p_wb2+
+                  theme(plot.title = element_text(size = 14),
+                        axis.title.x = element_text(size = 12),
+                        axis.title.y = element_text(size = 12),strip.text = element_text(size = 12),
+                        axis.text = element_text(size = 10),
+                        axis.text.y = element_text(size= 10),
+                        axis.text.x = element_text(size= 10, angle = 45, vjust = 1, hjust = 1)),
+                width = 6, height = 4)
+```
+
+# time points 2
+
+(experiment NT21_060)
+```{r}
+df_WB_60 <- read_csv("data/NT21_060_WB_quantification_22092021.csv")
+```
+
+## restructure factor time
+```{r}
+# restructure factor time
+df_WB_60$time <- factor(df_WB_60$time, levels = c( "30sec","1min", "2min", "5min", "10min", "30min", "1h", "2h", "3h", "6h", "12h", "24h", "48h", "72h", "96h"))
+
+df_WB_60 <- df_WB_60[order(df_WB_60$time), ]
+```
+
+```{r}
+p_wb3 <- df_WB_60 %>%
+  ggplot(aes(x = interaction(sample, time), y = change, fill =sample )) +
+  geom_bar(stat = "identity")+ #
+  scale_fill_manual(values = c("ctrl" = "black",#2F4F4F
+                                "TGFb" = "#999999"))+ ##424242", "#757575" ,"lightgrey
+  ggtitle("phosphorylated SMAD2 norm to SMAD2")+
+  #facet_wrap(~time)+
+  theme_bw()+
+  geom_hline(yintercept = 1, color = "gray26", linetype = "longdash")  #C0C0C0 708090 B2BEB5, B0C4D
+  
+p_wb3
+
+ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
+                                  Sys.Date(), "_", "NT21_060_WB_.pdf"),
+                plot = p_wb3+
+                  theme(plot.title = element_text(size = 14),
+                        axis.title.x = element_text(size = 12),
+                        axis.title.y = element_text(size = 12),
+                        strip.text = element_text(size = 12),
+                        axis.text = element_text(size = 10),
+                        axis.text.y = element_text(size= 10),
+                        axis.text.x = element_text(size= 9, angle = 45, vjust = 1, hjust = 1)),
+                width = 7, height = 3)
+```
+
+# time points 3
+(experiment NT21_063)
+```{r}
+df_WB_63 <- read_csv("data/NT21_063_WB_quantification_15112021.csv")
+```
+
+## restructure factor time
+```{r}
+# restructure factor time
+df_WB_63$time <- factor(df_WB_63$time, levels = c("2min", "5min", "10min", "30min", "1h", "3h", "6h", "12h", "24h", "48h", "72h","96h"))
+
+df_WB_63 <- df_WB_63[order(df_WB_63$time), ]
+```
+
+
+```{r}
+p_wb4 <- df_WB_63 %>%
+  filter(time != "SMAD2 KD", time !="NEG9 KD") %>%
+  ggplot(aes(x = interaction(sample,time), y = change, fill = sample )) +
+  geom_bar(stat = "identity")+ 
+  scale_fill_manual(values = c("ctrl" = "black",
+                                "TGF" = "#999999"))+ 
+  ggtitle("phosphorylated SMAD2 norm to SMAD2")+
+  #facet_wrap(~time)+
+  theme_bw()+
+  geom_hline(yintercept = 1, color = "gray26", linetype = "longdash")+  #C0C0C0 708090 B2BEB5, B0C4D
+  ggforce::facet_zoom(ylim = c(0, 7), zoom.data = ifelse(change <= 10), zoom.size = 1)+
+  theme(legend.position = "bottom",   # Move legend to the bottom
+        legend.key.size = unit(0.5, "cm"))
+  
+p_wb4
+
+ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
+                                  Sys.Date(), "_", "NT21_063_WB_.pdf"),
+                plot = p_wb4+
+                  theme(plot.title = element_text(size = 14),
+                        axis.title.x = element_text(size = 12),
+                        axis.title.y = element_text(size = 12),
+                        strip.text = element_text(size = 12),
+                        axis.text = element_text(size = 8),
+                        axis.text.y = element_text(size= 10),
+                        axis.text.x = element_text(size= 8, angle = 45, vjust = 1, hjust = 1)),
+                width = 8, height = 4)
+```
+
+## combine plots
+```{r}
+library(ggplot2)
+library(ggforce)
+library(patchwork)
+
+# Original plot
+p_wb4_main <- df_WB_63 %>%
+  filter(time != "SMAD2 KD", time != "NEG9 KD") %>%
+  ggplot(aes(x = interaction(sample,time), y = change, fill = sample)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("ctrl" = "black", "TGF" = "grey")) +
+  ggtitle("phosphorylated SMAD2") +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  geom_hline(yintercept = 1, color = "gray26", linetype = "longdash")
+
+# Zoom plot
+p_wb4_zoom <- df_WB_63 %>%
+  filter(time != "SMAD2 KD", time != "NEG9 KD") %>%
+  ggplot(aes(x = interaction(sample,time), y = change, fill = sample)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("ctrl" = "black", "TGF" = "grey")) +
+  ggtitle("phosphorylated SMAD2 (Zoomed)") +
+  theme_bw() +
+  geom_hline(yintercept = 1, color = "gray26", linetype = "longdash") +
+  facet_zoom(ylim = c(0, 7), zoom.data = ifelse(df_WB_63$change <= 10, TRUE, FALSE))
+
+# Arrange plots vertically
+plot_all <- p_wb4_main / p_wb4_zoom
+
+ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
+                                  Sys.Date(), "_", "NT21_063_WB_zoom.png"),
+                plot = plot_all+
+                  theme(axis.text = element_text(size = 11),
+                        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)),
+                width = 12, height = 12)
+
+```
