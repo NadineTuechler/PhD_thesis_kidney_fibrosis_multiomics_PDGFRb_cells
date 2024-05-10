@@ -1,0 +1,639 @@
+---
+title: "Data preprocessing"
+author: "**Author**: Martin Garrido Rodriguez-Cordoba, Nadine Tuechler and Mira Burtscher"
+date: "**Date**: `r Sys.Date()`"
+output: 
+  github_document:
+    toc: true
+    toc_depth: 5
+---
+
+# Summary
+
+The aim of this notebook is to preprocess raw data and to show some basic visualization of the datasets that compose the project.
+
+# Load libraries and data
+
+```{r load packages, message = FALSE, warning = FALSE}
+library(here)
+library(tidyverse)
+library(edgeR)
+library(vsn)
+library(cowplot)
+library(impute)
+library(limma)
+library(org.Hs.eg.db)
+library(biokit)
+library(OmnipathR)
+library(Biostrings)
+library(readr)
+```
+
+Read transcriptomics data and metadata
+
+```{r read transcriptomics}
+# read count table and metadata
+rna_counts <- read.table(here("data/raw_data/transcriptomics/counts.tsv"),
+    header = TRUE, row.names = 1)
+rna_metadata <- read.table(here("data/raw_data/transcriptomics/sample_table.tsv"),
+    header = TRUE) %>%
+  rownames_to_column(var = "matrix_id")
+rownames(rna_metadata) <- rna_metadata$matrix_id
+
+# match column order to metadata
+rna_counts <- rna_counts[, rna_metadata$matrix_id]
+```
+
+## New Secretomics data - trial Nadine 
+data exported with FragPipe
+```{r read secretomics}
+secretomics_raw_ <- read_csv(here("data/raw_data/secretomics/Full_dataset_V1_FragPipe.csv"))
+```
+
+
+
+## New proteomics data 
+(new data from Frank and Jenny after re-measuring 2nd rep, exported with FragPipe unlike before with MaxQuant)
+```{r proteomics}
+new_proteomics_V4 <- read_csv(here("data/raw_data/proteomics/Full_dataset_V4.csv")) 
+
+```
+
+# Preprocess transcriptomic data
+
+1. Translate IDs
+2. Filter lowly expressed genes with edgeR `filterByExpr()` function
+3. Normalize using edgeR's TMM + CPM
+
+```{r preprocess transcriptomics}
+# translate ids
+translated_counts <- rna_counts %>%
+  as.matrix() %>%
+  biokit::translateMatrixWithDb(
+    ., db = org.Hs.eg.db, sourceKey = "ENSEMBL", 
+    targetKey = "SYMBOL", summariseFun = base::sum
+  )
+
+#head(translated_counts)
+```
+
+remove outlier here or in second script (Rep A 24h ctrl: "lane1ctrl24hA", due to experimental problems)
+```{r outlier removal transcriptomics}
+# # outlier removal
+# translated_counts <- translated_counts[, colnames(translated_counts) != "lane1ctrl24hA"]
+# rna_metadata <- rna_metadata[rownames(rna_metadata) != "lane1ctrl24hA", ]
+```
+
+
+```{r process transcriptomics}
+# filter low expressed genes
+design_matrix <- model.matrix( ~ condition + time, data = rna_metadata ) 
+dge <- edgeR::DGEList(translated_counts)
+keep <- filterByExpr(y = dge, design = design_matrix)
+dge <- dge[keep, ]
+
+# normalized using TMM + CPM
+dge <- calcNormFactors(dge)
+rna_norm_expr <- cpm(dge, log = 1)
+```
+
+# Preprocess secretomics data
+
+Create metadata from column names
+
+```{r secretomics metadata}
+new_secretomics <- secretomics_raw_ %>%
+  dplyr::select(Gene, starts_with(("channel_"))) %>%
+  column_to_rownames("Gene") %>%  
+  as.matrix()
+colnames(new_secretomics) <- str_replace(colnames(new_secretomics),"channel_", "")
+
+# removed albumin as it is a contaminant 
+new_secretomics <- new_secretomics[rownames(new_secretomics) != "ALB", ]
+
+new_secretomics[which(is.nan(new_secretomics))] <- NA
+
+secretomics_metadata <- data.frame(row.names = colnames(new_secretomics),
+                                   matrix_id = colnames(new_secretomics)) %>%
+  mutate(condition = case_when(str_detect(matrix_id, "TGFb") ~ "TGF",
+                               TRUE ~ "ctrl"),
+         time = str_extract(matrix_id, "[0-9]+h"),
+         replicate = case_when(str_detect(matrix_id, "rep1") ~ "A",
+                               str_detect(matrix_id, "rep2") ~ "B",
+                               str_detect(matrix_id, "rep3") ~ "C"))
+```
+
+Remove ALB!! (as it is a contaminant)
+
+1. Normalize using VSN
+2. Impute missing values using KNN
+
+```{r secretomics normalization and imputation}
+# report proportion of data points imputed
+prop <- round(sum(is.na(new_secretomics) / length(new_secretomics)), 2)
+message(paste0("Proportion of data points imputed: ", prop))
+
+# vsn normalization
+secretomics_norm <- new_secretomics %>% 
+  justvsn() %>%
+  # knn imputation
+  impute.knn(.) %>%
+  .$data
+
+boxplot(secretomics_norm)
+```
+
+# Preprocess phosphoproteomics data
+
+```{r new proteomics data}
+# proteomics matrix
+# use protein.ID as these are uniprot IDs?
+proteomics <- new_proteomics_V4 %>%
+  dplyr::filter(is.na(STY.79.9663)) %>%
+  dplyr::filter(sequence.id == Gene) %>%
+  dplyr::select(sequence.id, starts_with(("signal_sum_input_"))) %>% 
+# group_by(Protein.ID) %>% 
+#   mutate(n = n()) %>% 
+#   filter(n == 2)
+# changed column name!
+  column_to_rownames("sequence.id") %>%  
+  as.matrix()
+colnames(proteomics) <- str_replace(colnames(proteomics),"signal_sum_input_", "")
+
+# phospho matrix
+# protein.id does not work here???
+phospho <- new_proteomics_V4 %>%
+   dplyr::filter(!is.na(STY.79.9663)) %>%
+  dplyr::mutate(sequence.id = paste0(sequence.id, "_", phospho.position)) %>% 
+   dplyr::select(sequence.id, starts_with(("signal_sum_phospho_"))) %>%
+  column_to_rownames("sequence.id") %>% 
+  as.matrix()
+colnames(phospho) <- str_replace(colnames(phospho),"signal_sum_phospho_", "")
+
+# corrected phospho matrix
+input_norm_phospho <- new_proteomics_V4 %>%
+  dplyr::filter(!is.na(STY.79.9663)) %>%
+   dplyr::mutate(sequence.id = paste0(sequence.id, "_", phospho.position)) %>% 
+  dplyr::select(sequence.id,  starts_with(("signal_sum_input.norm.phospho_"))) %>%
+  column_to_rownames("sequence.id") %>%
+  as.matrix()
+colnames(input_norm_phospho) <- str_replace(colnames(input_norm_phospho), 
+                                            "signal_sum_input.norm.phospho_", "")
+```
+```{r, eval=F }
+# separate(
+# data,
+# col = uniqueID, 
+# into = c("Gene",.,.), 
+# sep = "_",
+# remove = F
+# )
+```
+
+
+Normalize and impute
+
+```{r normalize and impute proteomics data}
+phospho_mat_list <- list(proteomics = proteomics, 
+                         phospho = phospho, 
+                         input_norm_phospho = input_norm_phospho)
+
+# threshold for imputation
+minimum_pct <- 0.7
+imputed_phospho_mat_list <- lapply(phospho_mat_list, function(x) {
+  print(nrow(x))
+  
+  na_pct <- apply(x, 1, function(x) 1 - (sum(is.na(x)) / length(x) ))
+  keep <- na_pct >= minimum_pct
+  are_nas <- is.na(x[!keep,])
+  
+  message("Discarding ", sum(!keep) / length(keep))
+  
+  message(paste0("NA proportion ", sum(are_nas) / length(x)))
+  x <- x[keep,]
+  
+  # norm
+  out_x <-  x %>%
+    justvsn() %>%
+    # impute
+  impute.knn(.) %>%
+  .$data
+  
+  return(out_x)
+
+})
+
+
+phospho_metadata_list <- lapply(imputed_phospho_mat_list, function(x) {
+  
+  data.frame(matrix_id = colnames(x)) %>%
+    mutate(condition = case_when(str_detect(matrix_id, "TGFbeta") ~ "TGF",
+                                 TRUE ~ "ctrl"),
+           time = str_extract(matrix_id, "[0-9]+h|[0-9]+min"),
+           replicate = case_when(str_detect(matrix_id, "rep1") ~ "A",
+                                 str_detect(matrix_id, "rep2") ~ "B",
+                                 str_detect(matrix_id, "rep3") ~ "C",
+                                 str_detect(matrix_id, "rep4") ~ "D")) %>%
+    mutate(time = ifelse(time == "t0_min", "0h", time)) %>%
+    mutate(time = ifelse(is.na(time), "0h", time)) %>%
+    mutate(time = ifelse(time == "01h", "1h", time))
+
+})
+
+boxplot(imputed_phospho_mat_list$proteomics)
+boxplot(imputed_phospho_mat_list$phospho)
+boxplot(imputed_phospho_mat_list$input_norm_phospho)
+
+```
+
+# Principal component analysis
+
+Quick fix of the time so the minutes do not rearrange
+
+```{r fix times}
+rna_metadata <- rna_metadata %>%
+  mutate(time = ifelse(time == "5min", "0.08h", time))
+
+phospho_metadata_list <- lapply(phospho_metadata_list, function(x) {
+  
+  outdf <- x %>%
+    mutate(time = ifelse(time == "5min", "0.08h", time))
+  
+  return(outdf)
+})
+```
+
+
+Next, perform PCA on both datasets
+
+```{r pca without batch correction, fig.width=12, fig.height=8}
+#' Create PCA plot using matrix and metadata
+#'
+#' @param mat Is a matrix with samples as columns and features (genes/proteins) as rows.
+#' @param metadata Is a data frame with samples as rows and features as columns (e.g. disease status or treatment time)
+#'
+#' @return A PCA plot with the proportion of variance explained by each PCA highlighted. Samples can be coloured using one of the columns of metadata
+#'
+#' @examples
+my_pca <- function(mat, metadata, x1, x2) {
+  
+  # perform principal component analysis
+  pca_res <- prcomp(t(mat))
+  pca_res_sum <-  summary(pca_res)
+  
+  # format proportion of explained variance per PC
+  variance_pcts <- round(pca_res_sum$importance[2, ] * 100, 2)
+  pc_pcts <- paste0(colnames(pca_res$x), " (", variance_pcts, "%)")
+  
+  # tidy pca results
+  tidy_pca <- data.frame(pca_res$x[,c("PC1", "PC2")]) %>%
+    rownames_to_column(var = "id") %>%
+    full_join(., metadata, by = c("id" = "matrix_id")) 
+  
+  # create main plot mit labels
+  p <- ggplot(tidy_pca, aes(x = PC1, y = PC2, color = condition, shape = time, label = id)) +
+    scale_color_manual(values= c("ctrl" = "#2BACC2", "TGF" = "#80146E")) +
+    scale_shape_manual(values = c("0h" = 4, "0.08h" = 1, "1h" = 17, "12h" = 15, "24h" = 18, "48h" = 16, "72h" = 8, "96h" = 9)) + #16
+    #scale_color_manual(values = c("0h" = "darkgrey",#
+                                  # "0.08h" = "#B8DEEB",
+                                  # "1h" = "#80B2D8",
+                                  # "12h" = "#729ACE",
+                                  # "24h" = "#6C81C3",
+                                  # "48h" = "#6E66B7",
+                                  # "72h" = "#7248AA",
+                                  # "96h" = "#781C9D"))+
+    geom_point(size = 2.5, alpha = 0.8) + 
+    xlim(x1,x2)+  # check whether we need x and y axis limits
+    ylim(x1,x2)+
+    xlab(pc_pcts[1]) + ylab(pc_pcts[2]) +
+    theme_cowplot() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  return(p)
+  
+}
+
+
+p1 <- my_pca(rna_norm_expr, rna_metadata, x1 = -40, x2 = 60) + ggtitle("RNA-Seq")
+p2 <- my_pca(secretomics_norm, secretomics_metadata, x1 = -20, x2 = 20) + ggtitle("Secretomics")
+p3 <- my_pca(imputed_phospho_mat_list$proteomics, phospho_metadata_list$proteomics, x1 = -10, x2 = 20) + 
+                                                  ggtitle("Proteomics")
+p4 <- my_pca(imputed_phospho_mat_list$phospho, phospho_metadata_list$phospho, x1= -20, x2=50) + 
+                                                  ggtitle("Phosphoproteomics")
+p5 <- my_pca(imputed_phospho_mat_list$input_norm_phospho, phospho_metadata_list$input_norm_phospho, x1= -20, x2=50) + 
+                                                  ggtitle("Input norm Phospho")
+
+
+plot_grid(p1, p2, p3, p4, p5, nrow = 2)
+```
+
+
+
+Same PCA, but removing batch effect caused by the replicate before visualization in secretomics data
+
+```{r pca with batch correction, fig.width=12, fig.height=7}
+no_batch_secretomics <- limma::removeBatchEffect(x = secretomics_norm, 
+                                                 batch = secretomics_metadata$replicate)
+
+no_batch_proteomics <- limma::removeBatchEffect(x = imputed_phospho_mat_list$proteomics, 
+                                                 batch = phospho_metadata_list$proteomics$replicate)
+
+no_batch_phospho <- limma::removeBatchEffect(x = imputed_phospho_mat_list$phospho, 
+                                                 batch = phospho_metadata_list$phospho$replicate)
+
+no_batch_input.norm.phos <- limma::removeBatchEffect(x = imputed_phospho_mat_list$input_norm_phospho, 
+                                                 batch = phospho_metadata_list$input_norm_phospho$replicate)
+
+
+p1 <- my_pca(rna_norm_expr, rna_metadata, x1 = -40, x2 = 60) + ggtitle("RNA-Seq")
+p2 <- my_pca(no_batch_secretomics, secretomics_metadata, x1 = -20, x2 = 15) + ggtitle("Secretomics")
+p3 <- my_pca(no_batch_proteomics, phospho_metadata_list$proteomics, x1 = -10, x2 = 20) + ggtitle("Proteomics")
+p4 <- my_pca(no_batch_phospho, phospho_metadata_list$phospho, x1 = -40, x2 = 50) + ggtitle("Phosphoproteomics")
+p5 <- my_pca(no_batch_input.norm.phos, phospho_metadata_list$input_norm_phospho, x1 = -20, x2 = 50) + ggtitle("Input norm Phospho")
+
+plot_grid(p1, p2, p3, p4, p5)
+
+#save plots
+ggplot2::ggsave(filename = here("graphs/PCA_allOmics_3_n.pdf"),
+                plot = plot_grid(p1, p2, p3, p4, p5),
+                width = 12, height = 6.5)
+```
+
+# PC loading vectors
+loading vectors e.g. for first PC of transcriptomics data
+```{r}
+pca_res <- prcomp(t(rna_norm_expr))
+
+rotation <- pca_res$rotation %>% as.data.frame() %>% select(PC1) %>% 
+  rownames_to_column("feature_id") %>% 
+  mutate(absPC1= abs(PC1)) %>% 
+  arrange(-absPC1) %>% 
+  head(20)
+
+p_rna1 <- rotation %>% 
+  ggplot(aes(y = reorder(feature_id, -absPC1), x = PC1))+
+  geom_bar(data = subset(rotation, PC1 > 0), fill = "#B30D1C", stat = "identity") +
+  geom_bar(data = subset(rotation, PC1 < 0), fill = "dodgerblue4", stat = "identity") +
+  labs(title = 'RNA PC1') +
+  ylab("feature")+
+  theme_minimal()
+
+```
+loading vectors e.g. for second PC of transcriptomics data
+```{r}
+PC <- "PC2"
+
+pca_res <- prcomp(t(rna_norm_expr))
+
+rotation <- pca_res$rotation %>% as.data.frame() %>% select(all_of(PC)) %>% 
+  rownames_to_column("feature_id") %>% 
+  mutate(absPC= abs(as.numeric(.data[[PC]]))) %>% 
+  arrange(-absPC) %>% 
+  head(20)
+
+p_rna2 <- rotation %>% 
+  ggplot(aes(y = reorder(feature_id, -absPC), x = PC2))+
+  geom_bar(data = subset(rotation, PC2 > 0), fill = "#B30D1C", stat = "identity") +
+  geom_bar(data = subset(rotation, PC2 < 0), fill = "dodgerblue4", stat = "identity") +
+  labs(title = paste0('RNA ', PC)) +
+  ylab("feature")+
+  theme_minimal()
+```
+
+proteomics
+```{r}
+PC <- "PC1"
+
+pca_res <- prcomp(t(no_batch_proteomics))
+
+rotation <- pca_res$rotation %>% as.data.frame() %>% select(all_of(PC)) %>% 
+  rownames_to_column("feature_id") %>% 
+  mutate(absPC= abs(as.numeric(.data[[PC]]))) %>% 
+  arrange(-absPC) %>% 
+  head(20)
+
+p_prot1 <- rotation %>% 
+  ggplot(aes(y = reorder(feature_id, -absPC), x = PC1))+
+  geom_bar(data = subset(rotation, PC1 > 0), fill = "#B30D1C", stat = "identity") +
+  geom_bar(data = subset(rotation, PC1 < 0), fill = "dodgerblue4", stat = "identity") +
+  labs(title = paste0('proteomics ', PC)) +
+  ylab("feature")+
+  theme_minimal()
+```
+```{r}
+PC <- "PC2"
+
+rotation <- pca_res$rotation %>% as.data.frame() %>% select(all_of(PC)) %>% 
+  rownames_to_column("feature_id") %>% 
+  mutate(absPC= abs(as.numeric(.data[[PC]]))) %>% 
+  arrange(-absPC) %>% 
+  head(20)
+
+p_prot2 <- rotation %>% 
+  ggplot(aes(y = reorder(feature_id, -absPC), x = PC2))+
+  geom_bar(data = subset(rotation, PC2 > 0), fill = "#B30D1C", stat = "identity") +
+  geom_bar(data = subset(rotation, PC2 < 0), fill = "dodgerblue4", stat = "identity") +
+  labs(title = paste0('proteomics ', PC)) +
+  ylab("feature")+
+  theme_minimal()
+```
+
+secretomics
+```{r}
+PC <- "PC1"
+
+pca_res <- prcomp(t(no_batch_secretomics))
+
+rotation <- pca_res$rotation %>% as.data.frame() %>% select(all_of(PC)) %>% 
+  rownames_to_column("feature_id") %>% 
+  mutate(absPC= abs(as.numeric(.data[[PC]]))) %>% 
+  arrange(-absPC) %>% 
+  head(20)
+
+p_secr1 <-rotation %>% 
+  ggplot(aes(y = reorder(feature_id, -absPC), x = PC1))+
+  geom_bar(data = subset(rotation, PC1 > 0), fill = "#B30D1C", stat = "identity") +
+  geom_bar(data = subset(rotation, PC1 < 0), fill = "dodgerblue4", stat = "identity") +
+  labs(title = paste0('secretomics ', PC)) +
+  ylab("feature")+
+  theme_minimal()
+```
+```{r}
+PC <- "PC2"
+
+rotation <- pca_res$rotation %>% as.data.frame() %>% select(all_of(PC)) %>% 
+  rownames_to_column("feature_id") %>% 
+  mutate(absPC= abs(as.numeric(.data[[PC]]))) %>% 
+  arrange(-absPC) %>% 
+  head(20)
+
+p_secr2 <- rotation %>% 
+  ggplot(aes(y = reorder(feature_id, -absPC), x = PC2))+
+  geom_bar(data = subset(rotation, PC2 > 0), fill = "#B30D1C", stat = "identity") +
+  geom_bar(data = subset(rotation, PC2 < 0), fill = "dodgerblue4", stat = "identity") +
+  labs(title = paste0('secretomics ', PC)) +
+  ylab("feature")+
+  theme_minimal()
+```
+
+phospho
+```{r}
+PC <- "PC1"
+
+pca_res <- prcomp(t(no_batch_input.norm.phos))
+
+rotation <- pca_res$rotation %>% as.data.frame() %>% select(all_of(PC)) %>% 
+  rownames_to_column("feature_id") %>% 
+  mutate(absPC= abs(as.numeric(.data[[PC]]))) %>% 
+  arrange(-absPC) %>% 
+  head(20)
+
+p_phospho1 <-rotation %>% 
+  ggplot(aes(y = reorder(feature_id, -absPC), x = PC1))+
+  geom_bar(data = subset(rotation, PC1 > 0), fill = "#B30D1C", stat = "identity") +
+  geom_bar(data = subset(rotation, PC1 < 0), fill = "dodgerblue4", stat = "identity") +
+  labs(title = paste0('input_phospho ', PC)) +
+  ylab("feature")+
+  theme_minimal()
+```
+```{r}
+PC <- "PC2"
+
+rotation <- pca_res$rotation %>% as.data.frame() %>% select(all_of(PC)) %>% 
+  rownames_to_column("feature_id") %>% 
+  mutate(absPC= abs(as.numeric(.data[[PC]]))) %>% 
+  arrange(-absPC) %>% 
+  head(20)
+
+p_phospho2 <- rotation %>% 
+  ggplot(aes(y = reorder(feature_id, -absPC), x = PC2))+
+  geom_bar(data = subset(rotation, PC2 > 0), fill = "#B30D1C", stat = "identity") +
+  geom_bar(data = subset(rotation, PC2 < 0), fill = "dodgerblue4", stat = "identity") +
+  labs(title = paste0('input_phospho ', PC)) +
+  ylab("feature")+
+  theme_minimal()
+```
+
+
+# function - save plots
+```{r save plots}
+# function to save my plots
+save_my_plot <- function(plot, name, plot_width){
+  output_dir <- here("graphs")
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir)
+  }
+  ggsave(plot, height = 6, width = plot_width, 
+         filename = file.path(output_dir, paste0(Sys.Date(), "_", name, ".pdf")))
+  }
+
+library(patchwork)
+
+axis_size = 11
+axis_title_size = 12
+title_size = 16
+
+
+save_my_plot(wrap_plots((p_rna1 +
+                                  theme(axis.text.x = element_text(size = axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size))+
+                          guides(color = FALSE)
+                           ) +
+                        (p_rna2 + theme(axis.text.x = element_text(size= axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size)))
+                        ), 
+             name = "RNA_PC1_PC2_loadings", plot_width = 7)
+
+
+save_my_plot(wrap_plots((p_prot1 +
+                                  theme(axis.text.x = element_text(size = axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size))+
+                          guides(color = FALSE)
+                           ) +
+                        (p_prot2 + theme(axis.text.x = element_text(size= axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size)))
+                        ), 
+             name = "proteomics_PC1_PC2_loadings", plot_width = 7)
+
+
+save_my_plot(wrap_plots((p_secr1 +
+                                  theme(axis.text.x = element_text(size = axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size))+
+                          guides(color = FALSE)
+                           ) +
+                        (p_secr2 + theme(axis.text.x = element_text(size= axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size)))
+                        ), 
+             name = "secretomics_PC1_PC2_loadings", plot_width = 7)
+
+
+save_my_plot(wrap_plots((p_phospho1 +
+                                  theme(axis.text.x = element_text(size = axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size))+
+                          guides(color = FALSE)
+                           ) /
+                        (p_phospho2 + theme(axis.text.x = element_text(size= axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size)))
+                        ), 
+             name = "phospho_PC1_PC2_loadings", plot_width = 9)
+
+```
+
+
+
+
+# Save preprocessed files
+
+```{r save resulting files}
+write_tsv(as.data.frame(rna_norm_expr) %>% 
+          rownames_to_column(var = "id"), 
+          file = here("data/processed_data/rna_norm_expr.tsv"))
+write_tsv(rna_metadata, 
+          file = here("data/processed_data/rna_metadata.tsv"))
+
+write_tsv(as.data.frame(imputed_phospho_mat_list$proteomics) %>% 
+          rownames_to_column(var = "id"), 
+          file = here("data/processed_data/prot_norm_expr_nobatchctrl.tsv"))
+write_tsv(phospho_metadata_list$proteomics, 
+          file = here("data/processed_data/prot_metadata.tsv"))
+
+write_tsv(as.data.frame(imputed_phospho_mat_list$phospho) %>% 
+          rownames_to_column(var = "id"), 
+          file = here("data/processed_data/phospho_norm_expr_nobatchctrl.tsv"))
+write_tsv(phospho_metadata_list$phospho, 
+          file = here("data/processed_data/phospho_metadata.tsv"))
+
+write_tsv(as.data.frame(imputed_phospho_mat_list$input_norm_phospho) %>% 
+          rownames_to_column(var = "id"), 
+          file = here("data/processed_data/input_phospho_norm_expr_nobatchctrl.tsv"))
+write_tsv(phospho_metadata_list$input_norm_phospho, 
+          file = here("data/processed_data/input_phospho_metadata.tsv"))
+
+write_tsv(as.data.frame(secretomics_norm) %>% 
+          rownames_to_column(var = "id"), 
+          file = here("data/processed_data/secretomics_norm.tsv"))
+write_tsv(secretomics_metadata, 
+          file = here("data/processed_data/secretomics_metadata.tsv"))
+
+
+
+write_tsv(as.data.frame(no_batch_proteomics) %>% 
+          rownames_to_column(var = "id"), 
+          file = here("data/processed_data/prot_norm_expr.tsv"))
+
+write_tsv(as.data.frame(no_batch_phospho) %>% 
+          rownames_to_column(var = "id"), 
+          file = here("data/processed_data/phospho_norm_expr.tsv"))
+
+write_tsv(as.data.frame(no_batch_input.norm.phos) %>% 
+          rownames_to_column(var = "id"), 
+          file = here("data/processed_data/input_phospho_norm_expr.tsv"))
+```

@@ -160,7 +160,6 @@ multiply65535 <- function(df){df %>%
   dplyr::mutate(Intensity_TotalIntensity_Collagen_x65535 = Intensity_TotalIntensity_Collagen * 65535)}
 
 # multiply 
-
 df_65535_A <- multiply65535(df_A)
 df_65535_B <- multiply65535(df_B)
 df_65535_C <- multiply65535(df_C) 
@@ -218,12 +217,10 @@ example to check background subtraction of unstained control
 plot_Col1_corr_per_cell_unstained_A <-
   ggplot(data = df_65535_new_A %>% 
            filter(condition == "unstained"),
-         aes(x = Count_Nuclei, y = intensity_diff_nNuclei_65535, colour = condition, shape = replicates)) + # y = Col1_per_cell
+         aes(x = Count_Nuclei, y = intensity_diff_nNuclei_65535, colour = condition, shape = replicates)) + 
   geom_point() + 
-#  facet_wrap( ~ time) +
   xlim(0,450)+
-  ggtitle("Col1 (BG,AF) corrected per cell - plate A") #+
-#  ylim(-5000000,15000000)
+  ggtitle("Col1 (BG,AF) corrected per cell - plate A") 
   
 plot_Col1_corr_per_cell_unstained_A
 ```
@@ -265,14 +262,13 @@ AF_subtraction <- function(df_first_AF, df_second){
 ```
 
 ```{r}
-# calculate autofluorescence signal 
+# calculate autofluorescence signal separately for each biological replicate (plate)
 df_A_AF <- AF_correction(df_65535_new_A)
 df_B_AF <- AF_correction(df_65535_new_B)
 df_C_AF <- AF_correction(df_65535_new_C)
 df_D_AF <- AF_correction(df_65535_new_D)
 
 # subtract autofluorescence per cell
-#df_A12_final <- AF_subtraction(df_first_AF = df_A12_AF, df_second = df_65535_A)
 df_A_final <- AF_subtraction(df_A_AF, df_65535_new_A)
 df_B_final <- AF_subtraction(df_B_AF, df_65535_new_B)
 df_C_final <- AF_subtraction(df_C_AF, df_65535_new_C)
@@ -280,16 +276,14 @@ df_D_final <- AF_subtraction(df_D_AF, df_65535_new_D)
 
 ```
 
-
+visual investigation
 ```{r}
 plot_Col1_corr_per_cell_AA <-
   ggplot(data = df_A_final, 
-         aes(x = Count_Nuclei, y = Col1_per_cell, colour = condition, shape = replicates)) + # y = Col1_per_cell
+         aes(x = Count_Nuclei, y = Col1_per_cell, colour = condition, shape = replicates)) + 
   geom_point() + 
   facet_wrap( ~ time) +
-  #xlim(0,450)+
-  ggtitle("Col1 (BG,AF) corrected per cell - plate A") # +
-#  ylim(-5000000,150000000)
+  ggtitle("Col1 (BG,AF) corrected per cell - plate A") 
   
 plot_Col1_corr_per_cell_AA
 ```
@@ -298,16 +292,14 @@ two outliers at 48h  --> remove values above 1.2e+07 (but should be gone with >2
 
 ```{r}
 # show which ones are the outlier images 
-outlier <- which(df_A_final$Count_Nuclei < 20) # & 
-                    #df$Count_NucleiAll<350 )#returns number of lines to be selected
+outlier <- which(df_A_final$Count_Nuclei < 20) 
 df_outliers <- df_A_final[outlier , ]
 
 
 # df with data that do not include the outliers
-outlier_ex <- which(df_A_final$Count_Nuclei > 20) # & 
-                    #df$Count_NucleiAll<350 )#returns number of lines to be selected
+outlier_ex <- which(df_A_final$Count_Nuclei > 20) 
 df_outliersEX <- df_A_final[outlier_ex , ]
-#data <- df_outliersEX
+
 ```
 
 ```{r}
@@ -330,7 +322,7 @@ does collagen deposition increase over time in ctrl?? -- might have to adjust ba
 
 # 7. Create full df with all replicates
 ```{r create full df}
-data <- rbind(df_A, df_B, df_C, df_D)
+data <- rbind(df_A_final, df_B_final, df_C_final, df_D_final)
 #data %<>% filter(siRNA != "NA")
 dim(data)
 ```
@@ -356,14 +348,12 @@ plot_Col1_corr_per_cell_all
 
 ```{r}
 # show which ones are the outlier images 
-outlier <- which(data$Count_Nuclei < 20, data$Col1_per_cell > 12000000) # & 
-                    #df$Count_NucleiAll<350 )#returns number of lines to be selected
+outlier <- which(data$Count_Nuclei < 20, data$Col1_per_cell > 12000000) 
 df_outliers <- data[outlier , ]
 
 
 # df with data that do not include the outliers
 outlier_ex <- which(data$Count_Nuclei > 20)
-                    #df$Count_NucleiAll<350 )#returns number of lines to be selected
 df_outliersEX <- data[outlier_ex , ]
 #data <- df_outliersEX
 ```
@@ -384,7 +374,7 @@ plot_Col1_corr_per_cell_all <-
 plot_Col1_corr_per_cell_all
 
 ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
-                                  Sys.Date(), "_", "NT22_004_all.png"),
+                                  Sys.Date(), "_", "NT22_004_all_.png"),
                 plot = plot_Col1_corr_per_cell_all +
                   theme(axis.text = element_text(size = 9),
                         axis.text.x = element_text(size=9, angle = 45, vjust = 1, hjust = 1),
@@ -395,7 +385,7 @@ ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
                 width = 8, height = 5)
 ```
 
-# save data
+#8.  save data
 ```{r}
 dir.create('output', showWarnings = FALSE)
 
@@ -415,10 +405,10 @@ to find images to show in the thesis
 
 
 
-# 8. Calculate ratios
+# 9. Calculate ratios
 ratio of TGF vs ctrl 
 
-## ratio ctrl vs TGF
+## 9.1 ratio ctrl vs TGF
 
 create df with intensity_norm_nuclei number values for each TGF treated sample
 ```{r}
@@ -464,8 +454,7 @@ df_ratio <- df_outliersEXnew %>%
 #                 width = 7, height = 5)
 ```
 
-## ratio ctrl vs TGF
-
+## 9.2 ratio ctrl vs TGF
 ```{r}
 df_ratio_2 <- df_outliersEXnew %>%
   #filter(condition == "TGF") %>%
@@ -482,27 +471,20 @@ p_test_2 <- df_ratio_2 %>%
   stat_summary(geom = "crossbar", fun= median, color = "black")+
   ggpubr::stat_compare_means(ref.group = "ctrl", label = "..p.signif..", method = 't.test')+# wilcoxon
   ggforce::geom_sina(aes(color = condition, shape = plate),size = 0.8, alpha = 0.6)+
-  scale_color_manual(values = c("#424242","#9E9E9E")) +#, #008B8Bggforce
-                                # "A" = "#80146E", #2F4F4F
-                                # "B" = "#7958AC", #00CED1
-                                # "C" = "#2BACCA"
- # geom_jitter(aes(color = plate),size = 1, width = 0.25, alpha = 0.6)+
+  scale_color_manual(values = c("#424242","#9E9E9E")) +
   facet_wrap(~time)+
-  geom_hline(yintercept = 0, color = "gray26", linetype = "longdash") + #C0C0C0 708090 B2BEB5, B0C4DE
-  ggtitle("LogFC TGF vs ctrl per time") +
-  #ylim(0,5)+
+  geom_hline(yintercept = 0, color = "gray26", linetype = "longdash") + 
   theme_bw()
   
 p_test_2
 
 ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
                                   Sys.Date(), "_", "NT22_004_TGFvsctrl_2.pdf"),
-                plot = p_test_2 ,#+
-                  #theme(axis.text = element_text(size = 11)),
+                plot = p_test_2 ,
                 width = 7, height = 5)
 ```
 
-# compare to 0h
+## 9.3 compare to 0h control
 
 create df with intensity_norm_nuclei number values for each TGF treated sample
 ```{r}
@@ -534,7 +516,7 @@ p_test_0h <- df_ratio_0h %>%
   scale_color_manual(values = c("ctrl" = "#424242", 
                                 "TGF" = "#9E9E9E")) +  facet_wrap(~time)+
   facet_wrap(~time)+
-  geom_hline(yintercept = 0, color = "gray26", linetype = "longdash") + #C0C0C0 708090 B2BEB5, B0C4DE
+  geom_hline(yintercept = 0, color = "gray26", linetype = "longdash") + 
   ggtitle("FC = (Col1_per_cell - mean_intensity_0h) / mean_intensity_0h") +
   ylim(-1.5,8.5)+
   theme_bw()
@@ -544,8 +526,7 @@ p_test_0h
 ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
                                   Sys.Date(), "_", "NT22_004_TGFvsctrl0h.png"),
                 plot = p_test_0h +
-                  theme(strip.text = element_text(size = 10)),#+
-                  #theme(axis.text = element_text(size = 11)),
+                  theme(strip.text = element_text(size = 10)),
                 width = 7, height = 5)
 ```
 

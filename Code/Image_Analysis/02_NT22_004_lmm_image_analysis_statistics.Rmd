@@ -1,0 +1,286 @@
+---
+title: "NT22_004_lmm_discrete_image_analysis_20230309_IMPORTANT"
+author: "Nadine Tuechler"
+date: '**Date**: `r Sys.Date()`'
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script was generated with input from Sarah Kaspar
+
+# Load libraries and repository 
+
+```{r load libraries}
+#BiocManager::install("ExploreModelMatrix")
+
+#knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ExploreModelMatrix)
+library(lme4)
+library(sdamr)
+library(patchwork)
+library(ggpubr)
+library(rstatix)
+library(multcomp)
+library(ggprism)
+library(gtools)
+library(lmerTest)
+library(emmeans)
+library(multcompView)
+library(sjPlot)
+library(dunn.test)
+library(broom.mixed)
+library(ggplot2)
+library(dplyr)
+library(sjtable2df)
+library(here)
+```
+```{r set parameters}
+PARAM <- list()
+PARAM$folder <- paste0(getwd(), "/")
+PARAM$folder.R <- gsub("code/", "",PARAM$folder)
+PARAM$folder.output <- paste0(PARAM$folder.R, "output/")
+PARAM$folder.figures <- paste0(PARAM$folder.R, "figures/linear_model/")
+PARAM$folder.data <- paste0(PARAM$folder.R, "data/")
+
+```
+
+# Data
+
+Using CellProfiler, we measured 
+- Intensity_TotalIntensity_Collagen: the intensities per image (Collagen 1 staining)
+- Count_Nuclei: nuclei (cell) number
+
+Initially, we multiplied the values with 65535 (16 bit images) as the CellProfiler outputs values between 0 and 1; to make the values more comparable e.g. to imageJ.
+
+Background corrections includes subtraction of the 
+- cover slip background * area of image
+- unspecific antibody staining (calculated by using the unstained control)
+   --> resulting column: Col1_bg_and_unspecificAB_corrected_65535
+   which is then normalized to cell number --> resulting in column "intensity_diff_nNuclei_65535"
+- autofluorescence (AF) correction (by using unstained control to calculate AF intensity per cell and subtract respective values per image)
+
+   --> resulting in Col1_per_cell where the intensity values are already normalized to the nuclei number and we receive a value for the Col1 intensity per cell
+   
+These steps are done per plate (biological replicate). All the dfs are then merged.
+    
+
+- plate: biological replicate, 24-well plate  
+- well: wells within the plate  
+- position: position within a well (36 positions per well)  
+- time: 0h, 12h, 24h, 48h, 72h, 96h  
+    - Time of treatment with TGF or the ctrl  
+    - 0h ctrl is NOT like the other controls  
+- condition: ctrl, TGF, unstained  
+- replicates: technical replicates on a plate  
+
+# load data
+```{r}
+data <- read.csv(here("output/NT22_004_Col1_20240127.csv"))
+```
+
+
+# Nadine's LMM lme4 (no nuclei number range)
+https://mspeekenbrink.github.io/sdam-r-companion/linear-mixed-effects-models.html
+
+# LMM - discrete time
+- calculate mean of all images per sample
+- duplicate 0h ctrl for TGFb. There is no 0h treatment but we need it for the model.
+- square root transform data to stabilize the variance (decided based on residuals plots) (Piepho 2009)
+- remove unstained condition
+```{r}
+model_dat_n <- data %>%
+  mutate(wellID = paste(plate,well, sep = "_")) %>%
+  group_by(plate, time, condition, replicates) %>% 
+  summarize(mean_int = mean(Col1_per_cell)) %>% # calculate mean per sample (among 36 images)
+  mutate(sqrt_mean_int = sqrt(mean_int)) %>% # sqrt transform
+  #mutate(log_mean_int = log(mean_int)) %>%
+  ungroup() %>%
+  filter(condition != "unstained") # this was only needed for autofluorescence correction
+
+# Filter rows with time == 0h
+filtered_rows <- model_dat_n %>% filter(time == "0h")
+
+# Duplicate rows
+duplicated_rows <- filtered_rows %>% slice(rep(1:n(), each = 1))
+
+# Rename condition to "TGF" in duplicated rows
+duplicated_rows$condition <- "TGF"
+
+# Combine the original and duplicated rows
+model_dat_discreteT_mean <- rbind(model_dat_n, duplicated_rows)
+```
+```{r linear mixed model discrete time}
+lme_model_discrete_mean <- lme4::lmer(formula = sqrt_mean_int ~ condition*time + (1|plate) , data = model_dat_discreteT_mean)
+
+summary(lme_model_discrete_mean)
+confint(lme_model_discrete_mean) # confidence intervals
+ranef(lme_model_discrete_mean) # to call random effects estimates
+```
+
+
+```{r}
+ExploreModelMatrix(sampleData = model_dat_discreteT_mean,designFormula = ~ condition*time)
+```
+
+
+
+out put from ranef() of lme_model_discrete_mean <- lme4::lmer(formula = sqrt_mean_int ~ condition*time + (1|plate)+ (1|plate:replicates) , data = model_dat_discreteT_mean)
+problem with this model is that replicates are only 2 instead of 23-24 per plate
+
+$`plate:replicates`
+        (Intercept)
+A:rep 1           0
+A:rep 2           0
+B:rep 1           0
+B:rep 2           0
+C:rep 1           0
+C:rep 2           0
+D:rep 1           0
+D:rep 2           0
+
+$plate
+  (Intercept)
+A   -282.1464
+B    404.8197
+C    452.2804
+D   -574.9538
+
+with conditional variances for “plate:replicates” “plate” 
+
+
+```{r linear mixed model discrete time}
+AIC(lme_model_discrete_mean)
+```
+```{r time as discrete}
+# with duplicated 0h
+lmertest_model_discrete_mean <- lmerTest::lmer(formula = sqrt_mean_int ~ condition*time + (1|plate) + (1|plate:replicates), data = model_dat_discreteT_mean)
+summary(lmertest_model_discrete_mean)
+```
+## Rediuals
+```{r residuals time as discrete}
+model_residuals_discrete_mean  <- resid(lme_model_discrete_mean)
+
+qqnorm(model_residuals_discrete_mean)
+qqline(model_residuals_discrete_mean)
+
+plot(density(model_residuals_discrete_mean))
+
+# save figures
+# Specify the file path directly
+pdf_file <- here("figures/linear_model/residuals_plot.pdf")
+
+pdf(file = pdf_file, width = 5, height = 4)
+
+residual_plot <- plot(fitted(lme_model_discrete_mean), model_residuals_discrete_mean, abline(0,0))
+print(residual_plot)
+
+dev.off()
+
+
+pdf_file <- here("figures/linear_model/qqnorm_plot.pdf")
+pdf(pdf_file, width = 5, height = 4)
+
+qqnorm(model_residuals_discrete_mean)
+qqline(model_residuals_discrete_mean)
+
+dev.off()
+
+
+pdf_file <- here("figures/linear_model/density_plot.pdf")
+pdf(pdf_file, width = 5, height = 4)
+
+plot(density(model_residuals_discrete_mean))
+
+dev.off()
+```
+
+
+## Anova 
+
+```{r post hoc anova time as discrete}
+lme_anova_discT_mean <- Anova(lme_model_discrete_mean, type = "III")
+lme_anova_discT_mean
+
+```
+
+## Post hoc discrete time 
+
+```{r post hoc time as discrete}
+post_hoc_discT_mean <- emmeans(lme_model_discrete_mean, ~ condition*time, adjust = "sidak", na.action = na.exclude) 
+post_hoc_discT_mean
+
+post_hoc_tab_discT_mean <- cld(post_hoc_discT_mean, alpha = 0.05, Letter = letters, adjust = "sidak")
+post_hoc_tab_discT_mean
+```
+
+
+## Visualize
+
+Predictions for time 0h and ctrl plate-wise:
+```{r}
+newdata <- data.frame(time= rep("0h",4),
+                      condition = rep("ctrl",4),
+                      plate = c("A","B","C","D"))
+
+norm_data <- newdata %>% 
+  mutate(norm_factor = predict(lme_model_discrete_mean, newdata=newdata)) %>% 
+  dplyr::select(plate, norm_factor)
+
+
+# plot
+data_norm_model <- model_dat_discreteT_mean %>% 
+  mutate(pred = predict(lme_model_discrete_mean)) %>% 
+  left_join(norm_data) %>% 
+  mutate(norm_sqrt_mean_int = sqrt_mean_int - norm_factor) %>% 
+  mutate(pred_norm = pred - norm_factor) %>% 
+  mutate(grouping = paste(plate,condition,sep=""))
+
+plot <-  data_norm_model %>%
+  ggplot(aes(x=time, y= norm_sqrt_mean_int, col=condition, shape = plate, group = grouping)) + 
+  scale_color_manual(values = c("ctrl" = "#4F87BF", 
+                                "TGF" = "#80146E")) +
+  scale_shape_manual(values = c("A" = 10, "B" = 17, "C" = 15, "D" = 16)) +
+  geom_jitter(alpha =0.7, width= 0.2) +
+  geom_line(aes(y=pred_norm, group=grouping)) +
+  theme_bw()
+
+plot
+
+# save
+ggplot2::ggsave(filename = paste0(PARAM$folder.figures,
+                                  Sys.Date(), "_", "NT22_004_modelLine.png"),
+                plot = plot + 
+                  theme(axis.text.x = element_text(size = 10, angle = 45, vjust = 1, hjust = 1),
+                        axis.text.y = element_text(size = 10),  # Adjust size of y-axis text
+                        axis.title = element_text(size = 12),  # Adjust size of axis labels
+                        #strip.text = element_text(size = 11),  # Adjust size of facet labels
+                        legend.text = element_text(size = 10),  # Adjust size of legend text
+                        legend.title = element_text(size = 12)),
+                 width = 5, height = 4)
+
+
+```
+
+
+
+
+```{r}
+plot_lmm_int_mean <- ggplot(fortify.merMod(lme_model_discrete_mean, data= getData(lme_model_discrete_mean)), aes(time, sqrt_mean_int, color=plate))+
+  stat_summary(fun.data = mean_se, geom="pointrange")+
+  #stat_summary(aes(y=.fitted), fun.y = mean, geom="line", size=1)+
+  theme_bw()+
+  scale_color_manual(values = c(A = "#9E0142",
+                                B = "#F46D43",
+                                C = "#FDAE61",
+                                D = "#66C2A5")) + 
+  facet_wrap(vars(condition))
+plot_lmm_int_mean
+```
+

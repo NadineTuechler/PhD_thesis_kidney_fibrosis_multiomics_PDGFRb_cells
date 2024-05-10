@@ -1,0 +1,201 @@
+---
+title: "Limma - differential expression analysis"
+author: "**Author**: Martin Garrido Rodriguez-Cordoba, Nadine Tuechler and Mira Burtscher"
+date: "**Date**: `r Sys.Date()`"
+output: 
+  github_document:
+    toc: true
+    toc_depth: 5
+---
+
+# Summary
+
+The aim of this notebook is to perform an analysis of potential transcription factors that control secreted proteins in response to TGFb. In other words, the question that we aim to answer in this analysis is: Which transcription factors regulate observed secreted proteins on each time point?
+
+# Load libraries and data
+
+```{r load packages, message = FALSE, warning = FALSE}
+library(here)
+library(tidyverse)
+library(limma)
+library(cowplot)
+library(decoupleR)
+library("OmnipathR")
+library(pheatmap)
+```
+
+
+```{r load data, message = FALSE, warning = FALSE}
+# read data matrixes
+expr_files <- list.files(here("data/processed_data/"), pattern = "*norm*", full.names = TRUE)
+mat_list <- lapply(expr_files, function(x) read_tsv(x) %>% column_to_rownames(var = "id") %>%
+  as.matrix())
+names(mat_list) <- basename(expr_files) %>% str_replace(".tsv", "")
+
+meta_files <- list.files(here("data/processed_data/"), pattern = "*metadata*", full.names = TRUE)
+meta_list <- lapply(meta_files, function(x) read_tsv(x))
+names(meta_list) <- basename(meta_files) %>% str_replace(".tsv", "")
+
+# Remove outlier sample from the 24h time point, after discussion with Nadine --> done in previous script
+# meta_list$rna_metadata <- subset(meta_list$rna_metadata, matrix_id != "lane1ctrl24hA")
+
+# summarize data in a list
+data_list <- list(
+  rna = list(data_matrix = mat_list$rna_norm_expr, metadata = meta_list$rna_metadata), 
+  proteomics = list(data_matrix = mat_list$prot_norm_expr, metadata = meta_list$prot_metadata), 
+  phospho = list(data_matrix = mat_list$phospho_norm_expr, metadata = meta_list$phospho_metadata), 
+  input_phospho = list(data_matrix = mat_list$input_phospho_norm_expr, metadata = meta_list$input_phospho_metadata),
+  secretomics = list(data_matrix = mat_list$secretomics_norm, metadata = meta_list$secretomics_metadata))
+rm(list=setdiff(ls(), "data_list"))
+
+# fix metadata to matrix mapping
+data_list <- imap(data_list, function(x, data_mod) {
+  
+  message(data_mod)
+  out_list <- list()
+  out_list$metadata <- x$metadata
+  out_list$data_matrix <- x$data_matrix[, x$metadata$matrix_id]
+  return(out_list)
+   
+})
+
+# save intermediate data
+saveRDS(data_list, here("data/processed_data/processed_data.rds"))
+```
+
+# Differential analysis
+
+To answer this question, we first need to answer the following question: Which genes and secreted proteins change on each time point in response to TGFb? For this, we perform a differential analysis using limma. We compare, for each time point, the TGFb treated versus the non-treated samples.
+
+```{r differential analysis with limma}
+# iterate over data list
+diff_results <- imap(data_list, function(modality_data, modality) {
+  
+  message(paste0("Processing: ", modality))
+  
+  data_matrix <- modality_data$data_matrix
+  metadata <- modality_data$metadata
+  
+  # define diff information
+  diff_df <- metadata %>%
+    as.data.frame() %>%
+    dplyr::filter(time != "0h") %>%
+    mutate(group = paste0(condition, "_", time))
+  rownames(diff_df) <- diff_df$matrix_id
+  
+  # define limma design matrix
+  # if secretomics, include replicate in the design matrix
+  if(modality == "secretomics") {
+    
+    design_matrix <- diff_df %>%
+      model.matrix(~ 0 + group + replicate, data = .)
+    
+  } else {
+    
+    design_matrix <- diff_df %>%
+      model.matrix(~ 0 + group , data = .)
+    
+  }
+  
+  # define contrasts
+  contrasts <- sapply(unique(diff_df$time), function(x) paste0("groupTGF_", x, "-groupctrl_", x))
+  contrast_matrix <- limma::makeContrasts(contrasts = contrasts, levels = design_matrix)
+  
+  # apply limma
+  fit <- limma::lmFit(data_matrix[, rownames(design_matrix)], design = design_matrix) %>%
+    limma::contrasts.fit(., contrasts = contrast_matrix) %>%
+    limma::eBayes(.)
+  
+  # get diff df
+  diff_table <- lapply(contrasts, function(x) limma::topTable(fit, coef = x, number = Inf) %>%
+                         mutate(comparison = x) %>%
+                         rownames_to_column(var = "feature_id")) %>%
+    bind_rows()
+  
+  return(diff_table)
+  
+}) %>%
+  bind_rows(.id = "modality") %>%
+  mutate(time = str_extract(comparison, "[0-9]+h|[0-9]+min|[0-9]+\\.[0-9]+h")) %>%
+  mutate(time = factor(time, levels = c("0.08h", "1h", "12h","24h", "48h", "72h", "96h"))) # changed from 5min to 0.08h
+
+write_tsv(diff_results, here("data/processed_data/diff_results.tsv"))
+```
+
+We can visualize the results with some volcano plots. We also define here the cutoffs that we will use later to filter the results
+
+```{r volcano plot from diff results, fig.width=12, fig.height=6}
+# define cutoffs
+lfc_cutoff <- log2(2)
+p_cutoff <- 0.05
+
+
+# volcano plot
+diff_results %>% 
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val), color = logFC)) +
+  geom_point() +
+  facet_grid(rows = vars(modality), cols = vars(time)) +
+  scale_color_gradient2(low = "blue", mid = "gray", high = "red", midpoint = 0) +
+  geom_hline(yintercept = -log10(p_cutoff), lty = 2) +
+  geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), lty = 2) +
+  theme_cowplot()
+```
+
+
+```{r volcano plot from diff results, fig.width=12, fig.height=6}
+lfc_cutoff <- log2(2)
+p_cutoff <- 0.05
+
+pdf(file=here("graphs/all_omics_vulcano_2_n.pdf"), width = 13, height = 9)
+
+# volcano plot
+p1 <- diff_results %>% 
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val), color = logFC)) +
+  geom_point() +
+  facet_grid(rows = vars(modality), cols = vars(time)) +
+  scale_color_gradient2(low = "blue", mid = "lightgray", high = "red", midpoint = 0) + #indianred, dodgerblue4, lightgrey
+  geom_hline(yintercept = -log10(p_cutoff), lty = 2) +
+  geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), lty = 2) +
+  theme_cowplot()
+
+p1 + theme(
+    axis.text.x = element_text(size = 11),         # axis text
+    axis.text.y = element_text(size = 11), 
+    axis.title.x = element_text(size = 16),        # axis titles
+    axis.title.y = element_text(size = 16),
+    strip.text = element_text(size = 14))         # facet labels
+  
+
+dev.off()
+
+```
+
+Create a summary of changing proteins
+
+```{r, fig.width=7, fig.height=5}
+hit_table <- diff_results %>%
+  subset(abs(logFC) >= lfc_cutoff & adj.P.Val <= p_cutoff) %>%
+  mutate(status = ifelse(logFC > 0, "up", "down")) %>% 
+  group_by(modality, comparison, status, time) %>%
+  summarise(count = n())
+
+hit_table
+
+hit_table %>%
+  ggplot(aes(x = comparison, y = count, label = count, fill = status)) +
+  geom_bar(stat = "identity", position = position_dodge(0.5), width = 0.3) +
+  geom_label(position = position_dodge(0.5), angle = 60) +
+  scale_fill_manual(values = c("up" = "red", "down"= "blue")) +
+  guides(x = guide_axis(angle = 60)) +
+  facet_grid(cols = vars(modality))
+
+hit_table %>%
+  ggplot(aes(x = time, y = count, label = count, fill = status)) +
+  geom_bar(stat = "identity", position = position_dodge(0.5), width = 0.3) +
+  geom_label(position = position_dodge(0.5), angle = 60) +
+  scale_fill_manual(values = c("up" = "red", "down"= "blue")) +
+  guides(x = guide_axis(angle = 60)) +
+  facet_grid(cols = vars(modality))
+
+```
+
