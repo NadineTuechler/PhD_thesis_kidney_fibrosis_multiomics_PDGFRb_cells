@@ -1,0 +1,380 @@
+---
+title: "Functional analysis of multi-omics data"
+output:
+  html_document:
+    keep_md: yes
+    toc: yes
+    theme: united
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+# General settings
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  include = TRUE,
+  cache = TRUE,
+  cache.lazy = FALSE,
+  eval = TRUE,
+  fig.width = 4 * (1 + sqrt(5)) / 2, 
+  fig.height = 4,
+  dpi = 700
+)
+```
+
+## Packages
+
+```{r, message=F, warning =F, include=}
+library(tidyverse)
+library(ggplot2); theme_set(cowplot::theme_cowplot(font_size = 15))
+library("reshape2")
+library(ggrepel)
+library(knitr)
+library(Biostrings)
+library(RColorBrewer)
+library(msigdbr)
+library(corrplot)
+library(GGally)
+library(here)
+
+mutate <- dplyr::mutate
+select <- dplyr::select
+group_by <- dplyr::group_by
+```
+
+```{r}
+options(ggplot2.discrete.colour= c("orange3", "darkslateblue", "darkred", "darkgreen", "darkgrey", "darkviolet"))
+options(ggplot2.discrete.fill= c("orange3", "darkslateblue", "darkred", "darkgreen", "darkgrey", "darkviolet"))
+```
+
+# 1. Explore hits
+
+Get an idea of data
+```{r}
+diff_results <- read_tsv("data/processed_data/diff_results_20230322.tsv", show_col_types = FALSE)
+```
+
+## number of hits
+```{r}
+lfc_cutoff <- log2(1.5)
+p_cutoff <- 0.05
+
+hit_table <- diff_results %>%
+  subset(abs(logFC) >= lfc_cutoff & adj.P.Val <= p_cutoff) %>%
+  mutate(status = ifelse(logFC > 0, "up", "down")) %>% 
+  group_by(modality, comparison, status, time) %>%
+  summarise(count = n())
+
+dummy_df <- data.frame(modality = c(unique(hit_table$modality)),
+                       time = factor(c("0h")), 
+                       count = 0,
+                       status = c(rep("up", length(unique(hit_table$modality))), rep("down", length(unique(hit_table$modality)))))
+
+p_hits <- hit_table %>%
+  bind_rows(dummy_df) %>%
+  mutate(time = factor(time, levels = c("0h", "0.08h", "1h", "12h","24h", "48h", "72h", "96h"))) %>%
+  ungroup() %>% 
+  tidyr::complete(time, status, modality, fill = list(count = 0)) %>% 
+  ggplot(aes(x = time, y = count, label = count, colour = status)) +
+  geom_point() +
+  geom_line(aes(group = status)) +
+  scale_colour_manual(values = c("up" = "red", "down"= "blue")) +
+  guides(x = guide_axis(angle = 60)) +
+  facet_wrap(~modality, scales = "free_y", ncol=2)
+
+p_hits 
+
+# ggplot2::ggsave(plot = p_hits, filename = "hits_2023.pdf", path = "/graphs/", width = 10, height = 6)
+```
+
+
+# 2.MSIGDB enrichment code
+
+```{r}
+msigdf_decoupler <- msigdbr::msigdbr(species = "Homo sapiens", category = "H") %>%
+  transmute(source = str_replace(gs_name, "HALLMARK_", ""), mor = 1, target = gene_symbol) %>%
+  distinct()
+```
+
+
+I included the ER for phospho normalised to input here as well, so this chunk now generates results for all modalities except phospho.
+
+```{r}
+decoupler_results <- diff_results %>% 
+  # only use the corrected phospho
+  filter(modality != "phospho") %>% 
+  # modify feature_id to be able to collapse phospho
+  mutate(feature_id = str_replace_all(feature_id,"___", "_")) %>% 
+  separate(feature_id, into =c("feature_id", "sequence", "multiplicity", "siteID")) %>% 
+  mutate(absFC = abs(logFC)) %>% 
+  group_by(modality,time, feature_id) %>%
+  # collapse phospho
+  mutate(maxlogFC = max(abs(logFC))) %>% 
+  filter(maxlogFC == absFC) %>% 
+  distinct(modality,time, feature_id, logFC) %>% 
+  group_by(modality) %>% 
+  nest(data = c(feature_id, logFC, time))%>% 
+  mutate(ER = map(data, function(df) { 
+    x = df %>%  acast(feature_id ~ time, value.var = "logFC")
+    decoupleR::run_wmean(mat = x, network = msigdf_decoupler)
+  }
+)) %>% 
+  select(-data) %>% 
+  unnest(cols = c(ER))
+
+```
+
+Visualise examples of significant pathways of all modalities and time points together
+```{r}
+p <- decoupler_results %>% 
+  filter(statistic == "norm_wmean" & p_value < 0.05 & abs(score) > 2) %>% 
+  #filter for pathways of interest
+  filter(source %in% c("TGF_BETA_SIGNALING",
+                       "EPITHELIAL_MESENCHYMAL_TRANSITION", 
+                       "HYPPOXIA",
+                       "INTERFERON_GAMMA_RESPONSE", 
+                       "INTERFERON_ALPHA_RESPONSE",
+                       "FATTY_ACID_METABOLISM",
+                       "TNFA_SIGNALING_VIA_NFKB",
+                       "MYOGENESIS",
+                       "COAGULATION",
+                       "ANGIOGENESIS", 
+                       "APICAL_JUNCTION",
+                       "CHOLESTEROL_HOMEOSTASIS",
+                       "E2F_TARGETS",
+                       "G2M_CHECKPOINT", 
+                       "P53_PATHWAY",
+                       "OXIDATIVE_PHOSPHORYLATION")) %>% 
+  filter(condition %in% c("0.08h","1h","12h","24h", "48h", "72h", "96h")) %>%
+  mutate(condition = factor(condition, levels = c("0.08h", "1h", "12h", "24h", "48h", "72h", "96h"))) %>%
+  ggplot(aes(y = source, x= score, colour = modality, shape = modality)) +
+  geom_point(size = 2, alpha = 0.9) + 
+  geom_vline(xintercept = c(-3,0,3), linetype =3) +
+  facet_wrap(~condition, scales = "free_y", ncol =1) +
+  theme(axis.text.y = element_text(size = 10), 
+        axis.text.x = element_text(size = 10),
+        legend.text = element_text(size = 9),
+        panel.grid.major.y = element_line(colour = "grey")) +
+  #scale_color_manual(values = c("rna" = "#66C2A5", "secretomics" = "#9E0142", "input_phospho" = "#FDAE61", "proteomics" = "#F46D43")) +
+  scale_shape_manual(values = c("rna" = 8, "secretomics" = 15, "input_phospho" = 17, "proteomics" = 16))
+
+p
+
+```
+
+```{r}
+# decoupler_results %>% 
+#   filter(statistic == "norm_wmean" & p_value < 0.05 & abs(score) > 2) %>% 
+#   ggplot(aes(y = source, x= score, shape = modality, size =3)) +
+#   geom_point() +
+#   geom_vline(xintercept = c(-3,0,3), linetype =3) +
+#   facet_wrap(~condition, scales = "free_y", ncol =2) +
+#   theme(axis.text.y = element_text(size = 9), panel.grid.major.y = element_line(colour = "grey"))
+```
+
+
+## 2.1 EMT pathway hallmarks
+EPITHELIAL_MESENCHYMAL_TRANSITION
+```{r}
+# factors that are hits/significant
+hits <- diff_results %>%
+  filter(adj.P.Val < 0.05 & abs(logFC) > log2(1.5))
+
+# for emt pathway only
+emt <- msigdf_decoupler %>%
+  filter(source=="EPITHELIAL_MESENCHYMAL_TRANSITION")
+
+# plot heatmap
+p_emt <- diff_results %>%
+  filter(!grepl("phospho", modality)) %>%
+  dcast(feature_id~modality + time, value.var = "logFC", fun.aggregate = median) %>%
+  filter(feature_id %in% hits$feature_id & feature_id %in% emt$target) %>%
+  column_to_rownames("feature_id") %>%
+  as.matrix() %>%
+  t() %>%
+  pheatmap::pheatmap(main = "EMT", 
+                     color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(8),  #new
+                     border_color = "grey", breaks = -4:4) #new)
+
+p_emt
+
+```
+
+
+```{r}
+P_EMT <- diff_results %>%
+  filter(!grepl("phospho", modality)) %>%
+  dcast(feature_id~modality + time, value.var = "logFC", fun.aggregate = median) %>%
+  filter(feature_id %in% hits$feature_id & feature_id %in% emt$target) %>%
+  column_to_rownames("feature_id") %>%
+  as.matrix() %>%
+  t() %>%
+  pheatmap::pheatmap(main = "EMT", 
+                     color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(8),  #new
+                     border_color = "grey", breaks = -4:4,
+                     cluster_cols = FALSE, scale = "none",
+                     silent = FALSE) #new)
+P_EMT
+
+```
+
+
+## 2.4 GO terms MSIGDB enrichment code
+
+to see MSIGDB collections use msigdbr_collections() 
+e.g. C5 is for GO:BP, GO:CC, GO:MF
+```{r}
+msigdf_decoupler_GO <- msigdbr::msigdbr(species = "Homo sapiens", category = "C5") %>% 
+  transmute(source = str_replace(gs_name,
+                                 "GO", ""), mor = 1, target = gene_symbol) %>%
+  distinct()
+```
+
+```{r}
+decoupler_results <- diff_results %>% 
+  # only use the corrected phospho
+  filter(modality != "phospho") %>% 
+  # modify feature_id to be able to collapse phospho
+  mutate(feature_id = str_replace_all(feature_id,"___", "_")) %>% 
+  separate(feature_id, into =c("feature_id", "sequence", "multiplicity", "siteID")) %>% 
+  mutate(absFC = abs(logFC)) %>% 
+  group_by(modality,time, feature_id) %>%
+  # collapse phospho
+  mutate(maxlogFC = max(abs(logFC))) %>% 
+  filter(maxlogFC == absFC) %>% 
+  distinct(modality,time, feature_id, logFC) %>% 
+  group_by(modality) %>% 
+  nest(data = c(feature_id, logFC, time))%>% 
+  mutate(ER = map(data, function(df) { 
+    x = df %>%  acast(feature_id ~ time, value.var = "logFC")
+    decoupleR::run_wmean(mat = x, network = msigdf_decoupler_GO)
+  }
+)) %>% 
+  select(-data) %>% 
+  unnest(cols = c(ER))
+
+```
+
+Visualise significant pathways of all modalities and timepoints together
+
+```{r}
+p_GO <- decoupler_results %>% 
+  filter(statistic == "norm_wmean" & p_value < 0.05 & abs(score) > 7) %>% # check score cut off 
+  ggplot(aes(y = source, x= score, colour = modality, shape = modality)) +
+  geom_point(size = 3) + #colkey = c("rna" = "#d01c8b", "secretomics" = "#f1b6da", "input_phospho" = "#4dac26", "proteomics" = "#b8e186")
+  geom_vline(xintercept = c(-3,0,3), linetype =3) +
+  facet_wrap(~condition, scales = "free_y", ncol =2) +
+  theme(axis.text.y = element_text(size = 9), panel.grid.major.y = element_line(colour = "grey"))
+
+p_GO
+
+```
+
+
+
+## 2.5 KEGG/REACTOME terms MSIGDB enrichment code
+
+to see MSIGDB collections use msigdbr_collections() 
+e.g. C2 is for CGP, CP, CP:BIOCARTA, CP:KEGG, CP:PID, CP:REACTOME, CP:WIKIPATHWAYS
+```{r}
+# KEGG
+msigdf_decoupler_KEGG <- msigdbr::msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG") %>% 
+  transmute(source = str_replace(gs_name,
+                                 "GP", ""), mor = 1, target = gene_symbol) %>%
+  distinct()
+
+# REACTOME
+msigdf_decoupler_react <- msigdbr::msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME") %>% 
+  transmute(source = str_replace(gs_name,
+                                 "REACTOME_", ""), mor = 1, target = gene_symbol) %>%
+  distinct()
+```
+
+
+```{r}
+decoupler_results <- diff_results %>% 
+  # only use the corrected phospho
+  filter(modality != "phospho") %>% 
+  # modify feature_id to be able to collapse phospho
+  mutate(feature_id = str_replace_all(feature_id,"___", "_")) %>% 
+  separate(feature_id, into =c("feature_id", "sequence", "multiplicity", "siteID")) %>% 
+  mutate(absFC = abs(logFC)) %>% 
+  group_by(modality,time, feature_id) %>%
+  # collapse phospho
+  mutate(maxlogFC = max(abs(logFC))) %>% 
+  filter(maxlogFC == absFC) %>% 
+  distinct(modality,time, feature_id, logFC) %>% 
+  group_by(modality) %>% 
+  nest(data = c(feature_id, logFC, time))%>% 
+  mutate(ER = map(data, function(df) { 
+    x = df %>%  acast(feature_id ~ time, value.var = "logFC")
+    decoupleR::run_wmean(mat = x, network = msigdf_decoupler_KEGG)
+  }
+)) %>% 
+  select(-data) %>% 
+  unnest(cols = c(ER))
+
+```
+
+Visualise significant pathways of all modalities and time points together
+
+```{r}
+p_KEGG <- decoupler_results %>% 
+  filter(statistic == "norm_wmean" & p_value < 0.05 & abs(score) > 3) %>% # check score cut off 
+  ggplot(aes(y = source, x= score, colour = modality, shape = modality)) +
+  geom_point(size = 3) + #colkey = c("rna" = "#d01c8b", "secretomics" = "#f1b6da", "input_phospho" = "#4dac26", "proteomics" = "#b8e186")
+  geom_vline(xintercept = c(-3,0,3), linetype =3) +
+  facet_wrap(~condition, scales = "free_y", ncol =2) +
+  theme(axis.text.y = element_text(size = 9), panel.grid.major.y = element_line(colour = "grey"))
+
+p_KEGG
+
+
+```
+
+REACTOME
+```{r}
+decoupler_results <- diff_results %>% 
+  # only use the corrected phospho
+  filter(modality != "phospho") %>% 
+  # modify feature_id to be able to collapse phospho
+  mutate(feature_id = str_replace_all(feature_id,"___", "_")) %>% 
+  separate(feature_id, into =c("feature_id", "sequence", "multiplicity", "siteID")) %>% 
+  mutate(absFC = abs(logFC)) %>% 
+  group_by(modality,time, feature_id) %>%
+  # collapse phospho
+  mutate(maxlogFC = max(abs(logFC))) %>% 
+  filter(maxlogFC == absFC) %>% 
+  distinct(modality,time, feature_id, logFC) %>% 
+  group_by(modality) %>% 
+  nest(data = c(feature_id, logFC, time))%>% 
+  mutate(ER = map(data, function(df) { 
+    x = df %>%  acast(feature_id ~ time, value.var = "logFC")
+    decoupleR::run_wmean(mat = x, network = msigdf_decoupler_react)
+  }
+)) %>% 
+  select(-data) %>% 
+  unnest(cols = c(ER))
+
+```
+
+Visualise significant pathways of all modalities and timepoints together
+
+```{r}
+p_react <- decoupler_results %>% 
+  filter(statistic == "norm_wmean" & p_value < 0.05 & abs(score) > 5) %>% # adjust score cut off accordingly
+  ggplot(aes(y = source, x= score, colour = modality, shape = modality)) +
+  geom_point(size = 3) + 
+  #colkey = c("rna" = "#d01c8b", "secretomics" = "#f1b6da", "input_phospho" = "#4dac26", "proteomics" = "#b8e186")
+  geom_vline(xintercept = c(-3,0,3), linetype =3) +
+  facet_wrap(~condition, scales = "free_y", ncol =2) +
+  theme(axis.text.y = element_text(size = 9), panel.grid.major.y = element_line(colour = "grey"))
+
+p_react
+
+```
