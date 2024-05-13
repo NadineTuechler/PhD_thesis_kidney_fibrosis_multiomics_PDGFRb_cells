@@ -1,0 +1,488 @@
+---
+title: "Clusters_variable_features"
+author: "**Author**: Nadine Tuechler supported by Mira Burtscher"
+date: "**Date**: `r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Summary
+
+The aim of this notebook is to cluster the most variable features for easier interpretation.
+
+# Load libraries and data
+
+```{r load packages, message = FALSE, warning = FALSE}
+library(here)
+library(tidyverse)
+library(pheatmap)
+library(cowplot)
+library(grid)
+library(UpSetR)
+library(RColorBrewer)
+library(ggplot2)
+library(reshape2)
+library(cluster)
+library(factoextra)
+
+data_list <- readRDS(here("data/processed_data/processed_data.rds")) 
+diff_results <- read_tsv(here("data/processed_data/diff_results_20230322.tsv"))
+```
+
+```{r}
+mutate <- dplyr::mutate
+select <- dplyr::select
+group_by <- dplyr::group_by
+filter <- dplyr::filter
+```
+```{r}
+options(ggplot2.discrete.colour= c("orange3", "darkslateblue", "darkred", "darkgreen", "darkgrey", "darkviolet"))
+options(ggplot2.discrete.fill= c("orange3", "darkslateblue", "darkred", "darkgreen", "darkgrey", "darkviolet"))
+```
+
+
+
+# Clusters 
+## rna
+### only hits
+```{r}
+hits <- diff_results %>%filter(modality == "rna" & abs(logFC) > log2(1.5) & adj.P.Val < 0.05)
+
+cluster_matrix <- diff_results %>% 
+  distinct(modality, feature_id, logFC, time) %>%
+  filter(modality == "rna") %>% 
+  dcast(feature_id~time, value.var = "logFC") %>% 
+  filter(feature_id %in% hits$feature_id) %>% 
+  drop_na() %>%  
+  column_to_rownames("feature_id") %>% 
+  as.matrix()
+
+set.seed(1)
+neural_clusters <- data.frame(
+  cluster = cclust::cclust(cluster_matrix, dist = "euclidean", method = "neuralgas", centers = 4)$cluster,
+  feature_id = rownames(cluster_matrix)) %>% 
+  inner_join(diff_results %>%filter(modality == "rna"), multiple = "all") %>% 
+  select(feature_id, cluster, time, logFC)
+
+# count features per cluster 
+unique_feature_count <- neural_clusters %>%
+  group_by(cluster) %>%
+  summarise(unique_features = n_distinct(feature_id))
+
+print(unique_feature_count)
+```
+
+
+
+Elbow method and silhouette
+https://uc-r.github.io/kmeans_clustering#elbow
+```{r}
+df <- cluster_matrix
+
+#create plot of number of clusters vs total within sum of squares
+one_hits <- fviz_nbclust(df, kmeans, method = "wss") #-->2 clusters or 3
+two <- fviz_nbclust(df, kmeans, method = "silhouette")
+```
+
+
+```{r}
+
+p_rna1_h <- neural_clusters %>%
+  bind_rows(data.frame(cluster = 1, time = "0h", logFC = 0, feature_id = "dummy")) %>%
+  complete(cluster, time, feature_id) %>% 
+  mutate(
+    logFC = ifelse(time == "0h", 0, logFC),
+    cluster = factor(cluster)
+  ) %>%
+  ungroup() %>%
+  filter(feature_id != "dummy") %>%
+  group_by(time, cluster) %>%
+  summarise(logFC = median(logFC, na.rm = T)) %>% 
+  mutate(time = as.numeric(str_remove(time, "h"))) %>% 
+  #filter(time < 13) %>% 
+  ggplot(aes(time, logFC,  colour = cluster)) +
+   geom_point(size = 2) +
+   geom_hline(yintercept = c(0.6,0, -0.6), linetype = 3) +
+   geom_line( aes(group = cluster), size =1)   +
+  #scale_colour_manual(values =c("3" = "indianred","4" = "darkred","2"= "dodgerblue1", "1"= "dodgerblue4")) +
+    labs(y = "logFC", x = "time [h]")+
+  theme_bw()
+
+
+p_rna2_h <-neural_clusters %>%
+  bind_rows(data.frame(cluster = 1, time = "0h", logFC = 0, feature_id = "dummy")) %>%
+  complete(cluster, time, feature_id) %>% 
+  mutate(
+    logFC = ifelse(time == "0h", 0, logFC),
+    cluster = factor(cluster)
+  ) %>%
+  ungroup() %>%
+  filter(feature_id != "dummy") %>% 
+  drop_na() %>% 
+  # group_by(time, cluster) %>%
+  # summarise(logFC = median(logFC, na.rm = T)) %>% 
+  mutate(time = as.numeric(str_remove(time, "h"))) %>% 
+  ggplot(aes(time, logFC,  colour = cluster)) +
+   #geom_point(size = 2) +
+   geom_hline(yintercept = c(0.6,0, -0.6), linetype = 3) +
+   geom_line( aes(group = feature_id), size =0.2)   +
+  #scale_colour_manual(values =c("3" = "indianred","4" = "darkred","2"= "dodgerblue1", "1"= "dodgerblue4")) +
+   facet_wrap(~cluster) +
+   labs(y = "logFC", x = "time [h]")+
+  theme_bw()
+
+```
+
+
+## proteomics
+### only hits
+```{r}
+hits <- diff_results %>%filter(modality == "proteomics" & abs(logFC) > log2(1.5) & adj.P.Val < 0.05)
+
+cluster_matrix <- diff_results %>% 
+  distinct(modality, feature_id, logFC, time) %>%
+  filter(modality == "proteomics") %>% 
+  dcast(feature_id~time, value.var = "logFC") %>% 
+  filter(feature_id %in% hits$feature_id) %>% 
+  drop_na() %>%  
+  column_to_rownames("feature_id") %>% 
+  as.matrix()
+
+set.seed(1)
+neural_clusters <- data.frame(
+  cluster = cclust::cclust(cluster_matrix, dist = "euclidean", method = "neuralgas", centers = 4)$cluster,
+  feature_id = rownames(cluster_matrix)) %>% 
+  inner_join(diff_results %>%filter(modality == "proteomics"), multiple = "all") %>% 
+  select(feature_id, cluster, time, logFC)
+
+# count features per cluster 
+unique_feature_count <- neural_clusters %>%
+  group_by(cluster) %>%
+  summarise(unique_features = n_distinct(feature_id))
+
+print(unique_feature_count)
+```
+
+Elbow method and silhouette
+https://uc-r.github.io/kmeans_clustering#elbow
+```{r}
+df <- cluster_matrix
+
+#create plot of number of clusters vs total within sum of squares
+three_hits <- fviz_nbclust(df, kmeans, method = "wss") #-->2 clusters or 3
+four_hits <- fviz_nbclust(df, kmeans, method = "silhouette")
+```
+
+```{r}
+
+p_prot1_h <- neural_clusters %>%
+  bind_rows(data.frame(cluster = 1, time = "0h", logFC = 0, feature_id = "dummy")) %>%
+  complete(cluster, time, feature_id) %>% 
+  mutate(
+    logFC = ifelse(time == "0h", 0, logFC),
+    cluster = factor(cluster)
+  ) %>%
+  ungroup() %>%
+  filter(feature_id != "dummy") %>%
+  group_by(time, cluster) %>%
+  summarise(logFC = median(logFC, na.rm = T)) %>% 
+  mutate(time = as.numeric(str_remove(time, "h"))) %>% 
+  #filter(time < 13) %>% 
+  ggplot(aes(time, logFC,  colour = cluster)) +
+   geom_point(size = 2) +
+   geom_hline(yintercept = c(0.6,0, -0.6), linetype = 3) +
+   geom_line( aes(group = cluster), size =1)   +
+  #scale_colour_manual(values =c("3" = "indianred","4" = "darkred","2"= "dodgerblue1", "1"= "dodgerblue4")) +
+  labs(y = "logFC", x = "time [h]")+
+  theme_bw()
+
+
+p_prot2_h <-neural_clusters %>%
+  bind_rows(data.frame(cluster = 1, time = "0h", logFC = 0, feature_id = "dummy")) %>%
+  complete(cluster, time, feature_id) %>% 
+  mutate(
+    logFC = ifelse(time == "0h", 0, logFC),
+    cluster = factor(cluster)
+  ) %>%
+  ungroup() %>%
+  filter(feature_id != "dummy") %>% 
+  drop_na() %>% 
+  # group_by(time, cluster) %>%
+  # summarise(logFC = median(logFC, na.rm = T)) %>% 
+  mutate(time = as.numeric(str_remove(time, "h"))) %>% 
+  ggplot(aes(time, logFC,  colour = cluster)) +
+   #geom_point(size = 2) +
+   geom_hline(yintercept = c(0.6,0, -0.6), linetype = 3) +
+   geom_line( aes(group = feature_id), size =0.2)   +
+  #scale_colour_manual(values =c("3" = "indianred","4" = "darkred","2"= "dodgerblue1", "1"= "dodgerblue4")) +
+   facet_wrap(~cluster) +
+  labs(y = "logFC", x = "time [h]")+
+  theme_bw()
+
+```
+
+
+## secretomics
+### only hits
+```{r}
+hits <- diff_results %>%filter(modality == "secretomics" & abs(logFC) > log2(1.5) & adj.P.Val < 0.05)
+
+cluster_matrix <- diff_results %>% 
+  distinct(modality, feature_id, logFC, time) %>%
+  filter(modality == "secretomics") %>% 
+  dcast(feature_id~time, value.var = "logFC") %>% 
+  filter(feature_id %in% hits$feature_id) %>% 
+  drop_na() %>%  
+  column_to_rownames("feature_id") %>% 
+  as.matrix()
+
+set.seed(1)
+neural_clusters <- data.frame(
+  cluster = cclust::cclust(cluster_matrix, dist = "euclidean", method = "neuralgas", centers = 4)$cluster,
+  feature_id = rownames(cluster_matrix)) %>% 
+  inner_join(diff_results %>%filter(modality == "secretomics"), multiple = "all") %>% 
+  select(feature_id, cluster, time, logFC)
+
+
+# count features per cluster 
+unique_feature_count <- neural_clusters %>%
+  group_by(cluster) %>%
+  summarise(unique_features = n_distinct(feature_id))
+
+print(unique_feature_count)
+```
+
+
+Elbow method and silhouette
+https://uc-r.github.io/kmeans_clustering#elbow
+```{r}
+df <- cluster_matrix
+
+#create plot of number of clusters vs total within sum of squares
+five_hits <- fviz_nbclust(df, kmeans, method = "wss") #-->2 clusters or 3
+six_hits <- fviz_nbclust(df, kmeans, method = "silhouette")
+```
+
+```{r}
+p_secr1_h <- neural_clusters %>%
+  bind_rows(data.frame(cluster = 1, time = "0h", logFC = 0, feature_id = "dummy")) %>%
+  complete(cluster, time, feature_id) %>% 
+  mutate(
+    logFC = ifelse(time == "0h", 0, logFC),
+    cluster = factor(cluster)
+  ) %>%
+  ungroup() %>%
+  filter(feature_id != "dummy") %>%
+  group_by(time, cluster) %>%
+  summarise(logFC = median(logFC, na.rm = T)) %>% 
+  mutate(time = as.numeric(str_remove(time, "h"))) %>% 
+  #filter(time < 13) %>% 
+  ggplot(aes(time, logFC,  colour = cluster)) +
+   geom_point(size = 2) +
+   geom_hline(yintercept = c(0.6,0, -0.6), linetype = 3) +
+   geom_line( aes(group = cluster), size =1)   +
+  #scale_colour_manual(values =c("3" = "indianred","4" = "darkred","2"= "dodgerblue1", "1"= "dodgerblue4")) +
+  labs(y = "logFC", x = "time [h]")+
+  theme_bw()
+
+
+p_secr2_h <-neural_clusters %>%
+  bind_rows(data.frame(cluster = 1, time = "0h", logFC = 0, feature_id = "dummy")) %>%
+  complete(cluster, time, feature_id) %>% 
+  mutate(
+    logFC = ifelse(time == "0h", 0, logFC),
+    cluster = factor(cluster)
+  ) %>%
+  ungroup() %>%
+  filter(feature_id != "dummy") %>% 
+  drop_na() %>% 
+  # group_by(time, cluster) %>%
+  # summarise(logFC = median(logFC, na.rm = T)) %>% 
+  mutate(time = as.numeric(str_remove(time, "h"))) %>% 
+  ggplot(aes(time, logFC,  colour = cluster)) +
+   #geom_point(size = 2) +
+   geom_hline(yintercept = c(0.6,0, -0.6), linetype = 3) +
+   geom_line( aes(group = feature_id), size =0.2)   +
+  #scale_colour_manual(values =c("3" = "indianred","4" = "darkred","2"= "dodgerblue1", "1"= "dodgerblue4")) +
+   facet_wrap(~cluster) +
+  labs(y = "logFC", x = "time [h]")+
+  theme_bw()
+
+```
+
+
+## phospho
+### only hits
+
+```{r}
+hits <- diff_results %>%filter(modality == "input_phospho" & abs(logFC) > log2(1.5) & adj.P.Val < 0.05)
+
+cluster_matrix <- diff_results %>% 
+  distinct(modality, feature_id, logFC, time) %>%
+  filter(modality == "input_phospho") %>% 
+  dcast(feature_id~time, value.var = "logFC") %>% 
+  filter(feature_id %in% hits$feature_id) %>% 
+  drop_na() %>%  
+  column_to_rownames("feature_id") %>% 
+  as.matrix()
+
+set.seed(1)
+neural_clusters <- data.frame(
+  cluster = cclust::cclust(cluster_matrix, dist = "euclidean", method = "neuralgas", centers = 4)$cluster,
+  feature_id = rownames(cluster_matrix)) %>% 
+  inner_join(diff_results %>%filter(modality == "input_phospho"), multiple = "all") %>% 
+  select(feature_id, cluster, time, logFC)
+
+
+# count features per cluster 
+unique_feature_count <- neural_clusters %>%
+  group_by(cluster) %>%
+  summarise(unique_features = n_distinct(feature_id))
+
+print(unique_feature_count)
+```
+
+
+```{r}
+df <- cluster_matrix
+
+#create plot of number of clusters vs total within sum of squares
+seven_hits <- fviz_nbclust(df, kmeans, method = "wss") #-->2 clusters or 3
+eight_hits <- fviz_nbclust(df, kmeans, method = "silhouette")
+```
+
+```{r}
+
+p_phos1_h <-neural_clusters %>%
+  bind_rows(data.frame(cluster = 1, time = "0h", logFC = 0, feature_id = "dummy")) %>%
+  complete(cluster, time, feature_id) %>% 
+  mutate(
+    logFC = ifelse(time == "0h", 0, logFC),
+    cluster = factor(cluster)
+  ) %>%
+  ungroup() %>%
+  filter(feature_id != "dummy") %>%
+  group_by(time, cluster) %>%
+  summarise(logFC = median(logFC, na.rm = T)) %>% 
+  mutate(time = as.numeric(str_remove(time, "h"))) %>% 
+  #filter(time < 10) %>% 
+  ggplot(aes(time, logFC,  colour = cluster)) +
+   geom_point(size = 2) +
+   geom_hline(yintercept = c(0.6,0, -0.6), linetype = 3) +
+   geom_line( aes(group = cluster), size =1)   +
+  # scale_colour_manual(values =c("3" = "indianred","4" = "darkred","2"= "dodgerblue1", "1"= "dodgerblue4")) +
+  labs(y = "logFC", x = "time [h]")+
+  theme_bw()
+
+
+p_phos2_h <- neural_clusters %>%
+  bind_rows(data.frame(cluster = 1, time = "0h", logFC = 0, feature_id = "dummy")) %>%
+  complete(cluster, time, feature_id) %>% 
+  mutate(
+    logFC = ifelse(time == "0h", 0, logFC),
+    cluster = factor(cluster)
+  ) %>%
+  ungroup() %>%
+  filter(feature_id != "dummy") %>% 
+  drop_na() %>% 
+  # group_by(time, cluster) %>%
+  # summarise(logFC = median(logFC, na.rm = T)) %>% 
+  mutate(time = as.numeric(str_remove(time, "h"))) %>% 
+  ggplot(aes(time, logFC,  colour = cluster)) +
+   #geom_point(size = 2) +
+   geom_hline(yintercept = c(0.6,0, -0.6), linetype = 3) +
+   geom_line( aes(group = feature_id), size =0.2)   +
+ # scale_colour_manual(values =c("3" = "indianred","4" = "darkred","2"= "dodgerblue1", "1"= "dodgerblue4")) +
+   facet_wrap(~cluster) +
+   labs(y = "logFC", x = "time [h]")+
+  theme_bw()
+
+```
+
+
+# function - save plots
+
+```{r}
+save_my_plot(wrap_plots((one_hits / 
+                          (p_rna1_h +
+                                  theme(axis.text.x = element_text(size = axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size))+
+                          guides(color = FALSE)
+                           )
+                        ),
+                        (p_rna2_h + theme(axis.text.x = element_text(size= axis_size, angle = 45, hjust = 1),
+                                                   axis.text.y = element_text(size = axis_size),
+                                                   axis.title = element_text(size = axis_title_size)))
+                        ), 
+             name = "RNA_elbow_overview_clusters_hits", plot_width = 10)
+
+save_my_plot(wrap_plots((three_hits / 
+                          (p_prot1_h +
+                                  theme(axis.text.x = element_text(size = axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size))+
+                          guides(color = FALSE)
+                           )
+                        ),
+                        (p_prot2_h + theme(axis.text.x = element_text(size= axis_size, angle = 45, hjust = 1),
+                                                   axis.text.y = element_text(size = axis_size),
+                                                   axis.title = element_text(size = axis_title_size)))
+                        ), 
+             name = "proteomics_elbow_overview_clusters_hits", plot_width = 10)
+
+save_my_plot(wrap_plots(five_hits / 
+                          (p_secr1_h + 
+                            theme(axis.text.x = element_text(size = axis_size),
+                              axis.text.y = element_text(size = axis_size),
+                              axis.title = element_text(size = axis_title_size)+
+                          guides(color = FALSE)
+                              )
+                           ), 
+             (p_secr2_h + 
+                facet_wrap(~cluster, ncol = 2)+
+                              theme(axis.text.x = element_text(size = axis_size,angle = 45, hjust = 1),
+                              axis.text.y = element_text(size = axis_size),
+                              axis.title = element_text(size = axis_title_size)
+                              )
+              )), 
+             name = "secretomics_elbow_overview_clusters_hits", plot_width = 10)
+
+save_my_plot(wrap_plots((seven_hits / 
+                          (p_phos1_h +
+                                  theme(axis.text.x = element_text(size = axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size))+
+                          guides(color = FALSE)
+                           )
+                        ),
+                        (p_phos2_h + theme(axis.text.x = element_text(size= axis_size, angle = 45, hjust = 1),
+                                                   axis.text.y = element_text(size = axis_size),
+                                                   axis.title = element_text(size = axis_title_size)))
+                        ), 
+             name = "input_phospho_elbow_overview_clusters_hits", plot_width = 10)
+
+
+save_my_plot(wrap_plots((seven_top / 
+                          (p_phos1_top +
+                                  theme(axis.text.x = element_text(size = axis_size),
+                                        axis.text.y = element_text(size = axis_size),
+                                        axis.title = element_text(size = axis_title_size))+
+                          guides(color = FALSE)
+                           )
+                        ),
+                        (p_phos2_top + theme(axis.text.x = element_text(size= axis_size, angle = 45, hjust = 1),
+                                                   axis.text.y = element_text(size = axis_size),
+                                                   axis.title = element_text(size = axis_title_size)))
+                        ), 
+             name = "input_phospho_elbow_overview_clusters_topVariable", plot_width = 10)
+
+
+```
+
+

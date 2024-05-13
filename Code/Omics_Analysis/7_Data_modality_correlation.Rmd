@@ -1,0 +1,149 @@
+---
+title: "8_modality_correlation"
+author: "Nadine Tuechler"
+date: "2023-03-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Summary
+
+# Load libraries and data
+
+```{r load libraries}
+#install.packages('corrplot')
+
+library(here)
+library(tidyverse)
+library(pheatmap)
+library(ggplot2)
+library(reshape2)
+library(corrplot)
+```
+```{r load data}
+diff_results <- read_tsv(here("data/processed_data/diff_results_20230322.tsv"))
+```
+
+```{r}
+mutate <- dplyr::mutate
+select <- dplyr::select
+group_by <- dplyr::group_by
+filter <- dplyr::filter
+```
+We need a matrix with genes as row names and columns e.g. Phospho-1h, phospho-12h, RNA, secretomics, proteomics-96h, etc.
+
+# Matrix
+create matrices of sequence_id and values for each time point and modality 
+```{r}
+corr_matrix_design <- function(data_modality, n_features_percent){ #, time_h
+  x <- diff_results %>%
+    filter(modality == data_modality) %>%  #, time == time_h
+    reshape2::dcast(feature_id~comparison, value.var = "logFC") %>%
+    na.omit() %>%
+    column_to_rownames("feature_id") %>%
+    as.matrix()
+
+  perc = round((nrow(x)/100)*n_features_percent)
+  
+  x <- x[matrixStats::rowVars(x, na.rm = T) %>% 
+                                    order(decreasing = T) %>% head(perc), ] # 2000 most variable features 
+}
+
+rna_m <- corr_matrix_design(data_modality = "rna", n_features_percent = 10)
+proteomics_m <- corr_matrix_design("proteomics", n_features_percent = 10) 
+secretomics_m <- corr_matrix_design("secretomics", n_features_percent = 10)
+
+# rna_m2 <- corr_matrix_design(data_modality = "rna", n_features = 5000)
+# proteomics_m2 <- corr_matrix_design("proteomics", n_features = 5000) 
+# secretomics_m2 <- corr_matrix_design("secretomics", n_features = 5000)
+
+```
+
+create list with matrices of genes and t value for each time point
+```{r matrix list and dorothea}
+corr_list <- list(rna_m, proteomics_m, secretomics_m)
+```
+
+
+format data frame - rename columns as the column names got lost
+```{r column names}
+corr_df <- data.frame(t(data.table::rbindlist(
+  lapply(corr_list, function(x) data.table::data.table(t(x))),
+  fill = TRUE)))
+
+colnames(corr_df) <- c("rna_0.08h", "rna_12h", "rna_1h", "rna_24h", "rna_48h", "rna_72h", "rna_96h", "proteomics_0.08h", "proteomics_12h", "proteomics_1h", "proteomics_24h", "proteomics_48h", "proteomics_72h", "proteomics_96h", "secretomics_12h", "secretomics_24h", "secretomics_48h", "secretomics_72h", "secretomics_96h")
+# order columns
+corr_df <- corr_df[, c("rna_0.08h", "rna_1h", "rna_12h", "rna_24h", "rna_48h", "rna_72h", "rna_96h", "proteomics_0.08h", "proteomics_1h", "proteomics_12h", "proteomics_24h", "proteomics_48h", "proteomics_72h", "proteomics_96h", "secretomics_12h", "secretomics_24h", "secretomics_48h", "secretomics_72h", "secretomics_96h")]
+
+```
+
+
+
+# Correlation matrix
+plots - data modalities
+https://cran.r-project.org/web/packages/corrplot/vignettes/corrplot-intro.html
+or http://www.sthda.com/english/wiki/ggcorrplot-visualization-of-a-correlation-matrix-using-ggplot2
+or https://www.huber.embl.de/users/jlu/Proteomics/batch13Combine/bufferAnalysis.html#Protein-RNA_correlation_across_proteins
+https://rstudio-pubs-static.s3.amazonaws.com/240657_5157ff98e8204c358b2118fa69162e18.html#methods-for-correlation-analyses
+compute correlation coefficient
+
+```{r}
+M <- cor(corr_df, method = "pearson", use = "complete.obs")
+```
+
+
+# Correlation plot
+```{r corrplot }
+
+#pdf(file = here("graphs", "corrplot_top10percentfeatures.pdf"), width = 6, height = 6)
+
+corrplot(M)
+
+#dev.off()
+
+```
+
+
+# correlation p value
+http://www.sthda.com/english/wiki/correlation-matrix-a-quick-start-guide-to-analyze-format-and-visualize-a-correlation-matrix-using-r-software
+```{r}
+#install.packages("Hmisc")
+library(Hmisc)
+res2 <- rcorr(as.matrix(corr_df))
+
+# correlation coefficient
+res2$r
+
+# p values
+res2$P
+
+#pdf(file=here("graphs/corrplot_10percentfeatures_triange_45.pdf"), width = 6, height = 6)
+
+corrplot::corrplot(res2$r, 
+         type = "lower", 
+         tl.col = "black", 
+         tl.srt = 45,
+         tl.cex = 0.8) #order = "hclust", 
+
+#dev.off()
+
+
+#png(file = here("graphs/corrplot_10percentfeatures_triangle__lower_45.png"), width = 1500, height = 1500, res = 300)
+
+
+corrplot(res2$r, 
+         type = "lower", 
+         tl.col = "black", 
+         tl.srt = 45,
+         tl.cex = 0.8) #order = "hclust", 
+
+#dev.off()
+
+
+res3 <- rcorr(as.matrix(corr_df2))
+corrplot(res3$r, type = "upper",  
+         tl.col = "black", tl.srt = 45) 
+```

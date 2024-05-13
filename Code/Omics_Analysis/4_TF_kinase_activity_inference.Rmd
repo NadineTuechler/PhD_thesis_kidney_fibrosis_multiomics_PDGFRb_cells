@@ -1,0 +1,445 @@
+---
+title: "Functional analysis of multi-omics data"
+output:
+  html_document:
+    keep_md: yes
+    toc: yes
+    theme: united
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+# General settings
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  include = TRUE,
+  cache = TRUE,
+  cache.lazy = FALSE,
+  eval = TRUE,
+  fig.width = 4 * (1 + sqrt(5)) / 2, 
+  fig.height = 4,
+  dpi = 700
+)
+```
+
+## Packages
+
+```{r, message=F, warning =F, include=}
+library(tidyverse)
+library(ggplot2); theme_set(cowplot::theme_cowplot(font_size = 15))
+library("reshape2")
+library(ggrepel)
+library(knitr)
+library(Biostrings)
+library(RColorBrewer)
+library(msigdbr)
+library(corrplot)
+library(GGally)
+library(here)
+
+mutate <- dplyr::mutate
+select <- dplyr::select
+group_by <- dplyr::group_by
+```
+
+```{r}
+options(ggplot2.discrete.colour= c("orange3", "darkslateblue", "darkred", "darkgreen", "darkgrey", "darkviolet"))
+options(ggplot2.discrete.fill= c("orange3", "darkslateblue", "darkred", "darkgreen", "darkgrey", "darkviolet"))
+```
+
+```{r}
+diff_results <- read_tsv("data/processed_data/diff_results_20230322.tsv", show_col_types = FALSE)
+```
+
+
+# 2.MSIGDB enrichment code
+```{r}
+msigdf_decoupler <- msigdbr::msigdbr(species = "Homo sapiens", category = "H") %>%
+  transmute(source = str_replace(gs_name, "HALLMARK_", ""), mor = 1, target = gene_symbol) %>%
+  distinct()
+```
+
+
+#3. Kinase enrichment
+
+##A Prepare PKN
+
+```{r}
+res_kinase_enrichment <- list()
+
+res_kinase_enrichment$KSN  <- OmnipathR::get_signed_ptms() %>%
+  dplyr::filter(modification %in% c("dephosphorylation","phosphorylation")& sources != "ProtMapper") %>%
+  dplyr::filter(!(stringr::str_detect(sources, "ProtMapper") & n_resources == 1)) %>% 
+  dplyr::mutate(p_site = paste0(substrate_genesymbol, "_",residue_type, residue_offset),
+                mor = ifelse(modification == "phosphorylation", 1, -1),
+                likelihood = 1) %>%
+  dplyr::transmute(p_site, enzyme_genesymbol, mor) %>%
+  as.data.frame() %>% 
+  mutate( id = paste(p_site,enzyme_genesymbol,sep =""))
+
+res_kinase_enrichment$KSN <- res_kinase_enrichment$KSN[!duplicated(res_kinase_enrichment$KSN$id),]
+res_kinase_enrichment$KSN <- res_kinase_enrichment$KSN[,-5]
+
+
+res_kinase_enrichment$KSN <- select(res_kinase_enrichment$KSN, source= enzyme_genesymbol, target = p_site, mor)
+```
+
+##B Kinase enrichment
+
+Using the run_wmean of decoupleR
+
+```{r}
+res_kinase_enrichment$enrichment <- 
+  diff_results %>%  
+  filter(modality == "input_phospho") %>% 
+  mutate(siteID = str_extract(feature_id, ".\\d+$"),
+         Gene = str_extract(feature_id,"^[:alnum:]+"))%>% 
+  mutate(substrateID = paste0(Gene, "_", siteID)) %>% 
+  group_by(time, substrateID) %>% 
+  summarise(logFC = mean(logFC))%>% 
+  group_by(time) %>% 
+  nest(data = c(substrateID, logFC)) %>% 
+  mutate(ER = map(data,function(df){
+    ER = as.data.frame(
+  decoupleR::run_wmean(
+    mat = as.matrix(df %>% column_to_rownames("substrateID")),
+    network = res_kinase_enrichment$KSN,
+    .source = "source"
+  ))
+  }))%>%
+    select(-data) %>%
+    unnest()
+```
+
+##C Extract results
+
+Visualise as heatmap
+
+```{r}
+hit_kinases <- res_kinase_enrichment$enrichment %>% 
+  filter(p_value < 0.03 & statistic == "norm_wmean" & abs(score) >3)
+
+
+set.seed(7)
+#set.seed(4)
+
+res_kinase_enrichment$enrichment %>% 
+  filter(source %in% hit_kinases$source& statistic == "norm_wmean") %>% 
+  mutate(time = factor(time, levels=c("0.08h", "1h", "12h", "24h", "48h", "72h", "96h"))) %>% 
+  acast(time~source, value.var = "score") %>% 
+  t() %>% 
+  #scale() %>% 
+   ComplexHeatmap::Heatmap(
+  cluster_columns = F,
+  # number of clusters
+  km = 5,
+  show_row_dend = F,
+  show_column_dend = F,
+  show_row_names = T,
+   row_names_gp = grid::gpar(fontsize = 8),  
+  col = circlize::colorRamp2(c(-6, 0, 6), c("dodgerblue4", "white","darkred")), #mediumseagreen
+  name = "kinase_score"
+  )
+
+```
+
+##D MSIGDB Ernichment
+
+MSigdb enrichment with kinases
+
+```{r}
+res_kinase_enrichment$ER_msig <-  res_kinase_enrichment$enrichment %>%
+  filter(source %in% hit_kinases$source& statistic == "norm_wmean") %>% 
+  distinct(time, source, score) %>% 
+  acast(source ~ time, value.var = "score") %>% 
+  decoupleR::run_wmean(network = msigdf_decoupler)
+
+res_kinase_enrichment$ER_msig %>% 
+  filter(statistic == "norm_wmean" & p_value < 0.2) %>% 
+  ggplot(aes(y = source, x= score, colour = condition)) +
+  geom_point() +
+  geom_vline(xintercept = 0, linetype =3) +
+  #facet_wrap(~condition, scales = "free_y", ncol =2) +
+  theme(axis.text.y = element_text(size = 8), panel.grid.major.y = element_line(colour = "grey"))
+```
+
+## Save
+
+```{r}
+save(res_kinase_enrichment, file ="data/processed_data/230403_kinase_enrichment_result.RData")
+```
+
+### MAP2K1 targets 
+as an example
+```{r}
+kin <- "MAP2K1"
+
+deg <- diff_results %>%
+  filter(modality == "input_phospho") %>% # try with phospho as well
+  mutate(siteID = str_extract(feature_id, ".\\d+$"),
+         Gene = str_extract(feature_id,"^[:alnum:]+"),
+         target = paste0(Gene, "_", siteID))%>%
+  ungroup()%>%
+  distinct(target, time, Gene, t, logFC, P.Value, adj.P.Val) %>%
+  mutate(hit = ifelse(adj.P.Val < 0.05 &abs(logFC) > log(1.5), "hit", "no hit")) %>%
+  mutate(hit = ifelse(hit == "hit" & logFC < 0, "down", hit)) %>%
+  mutate(hit = ifelse(hit == "hit" & logFC > 0, "up", hit)) %>%
+  mutate(label = ifelse(hit != "no hit", target, "")) %>%
+  mutate(time = factor(time, levels = c("0.08h", "1h", "12h","24h", "48h", "72h", "96h")))
+
+df <- res_kinase_enrichment$KSN %>%
+  filter(source == kin)
+
+pMAP2K1 <- deg %>%
+  filter(target %in% df$target) %>%
+  ggplot(aes(x = logFC, y = -log10(P.Value), colour = hit)) +
+  geom_point() +
+  geom_text_repel(aes(label = label), size =2) +
+  scale_colour_manual(values = c("up" = "indianred", "no hit" = "lightgrey","down" = "dodgerblue4")) +
+  facet_wrap(~time)+
+  ggtitle("MAP2K1")
+
+pMAP2K1
+```
+
+
+# 4. TF activity inference
+## 4.1 TF based on RNAseq data
+```{r}
+library(decoupleR)
+net_dorothea <- get_dorothea(organism='human', levels=c('A', 'B', 'C')) 
+
+res_tf_enrichment <- list()
+res_tf_enrichment$enrichment <-   
+  diff_results %>%  
+  filter(modality == "rna") %>% 
+  mutate(Gene =feature_id)%>% 
+  ungroup() %>% 
+  distinct(time, Gene, t) %>% 
+  group_by(time) %>% 
+  nest(data = c(Gene, t))%>% 
+  mutate(ER = map(data,function(df){
+    ER = as.data.frame(
+  decoupleR::run_mlm(
+    mat = as.matrix(df %>% column_to_rownames("Gene")),
+     net=net_dorothea,
+    .source='source',
+    .target='target', 
+    .mor='mor', 
+    minsize = 5
+  ))
+  }))%>%
+    select(-data) %>%
+    unnest(cols = c(ER))
+```
+
+Visualise TFs as heatmap
+
+```{r}
+hit_tfs <- res_tf_enrichment$enrichment %>% 
+  filter(p_value < 0.03 & statistic == "mlm" & abs(score) >3)
+
+set.seed(6)
+res_tf_enrichment$enrichment %>% 
+  filter(source %in% hit_tfs$source& statistic == "mlm") %>% 
+  mutate(time = factor(time, levels=c("0.08h", "1h", "12h", "24h", "48h", "72h", "96h"))) %>% 
+  acast(time~source, value.var = "score") %>% 
+  t() %>% 
+  #scale() %>% 
+   ComplexHeatmap::Heatmap(
+  cluster_columns = F,
+  # number of clusters
+  km = 5,
+  show_row_dend = F,
+  show_column_dend = F,
+  show_row_names = T,
+   row_names_gp = grid::gpar(fontsize = 8),  
+  col = circlize::colorRamp2(c(-6, 0, 6), c("dodgerblue4", "white","darkred")), #mediumseagreen
+  name = "TF_score"
+  )
+
+```
+
+Save
+
+```{r}
+save(res_tf_enrichment, file ="data/processed_data/230403_tf_enrichment_result.RData")
+TF_rna <- res_tf_enrichment
+```
+
+### 4.1.1 NR4A1 targets 
+```{r}
+tf <- "NR4A1"
+deg <- diff_results %>%  
+  filter(modality == "rna") %>% 
+  mutate(Gene = feature_id)%>% 
+  ungroup()%>% 
+  distinct(time, Gene, t, logFC, P.Value, adj.P.Val) %>% 
+  mutate(hit = ifelse(adj.P.Val < 0.05 &abs(logFC) > log(2), "hit", "no hit")) %>% 
+  mutate(hit = ifelse(hit == "hit" & logFC < 0, "down", hit)) %>% 
+  mutate(hit = ifelse(hit == "hit" & logFC > 0, "up", hit)) %>% 
+  mutate(label = ifelse(hit != "no hit", Gene, "")) %>% 
+  mutate(time = factor(time, levels = c("0.08h", "1h", "12h","24h", "48h", "72h", "96h")))
+
+df <- net_dorothea %>%
+  filter(source == tf)
+
+pNR4A1 <- deg %>% 
+  filter(Gene %in% df$target) %>% 
+  ggplot(aes(x = logFC, y = -log10(P.Value), colour = hit)) +
+  geom_point() +
+  geom_text_repel(aes(label = label), size =4) +
+  scale_colour_manual(values = c("up" = "indianred", "no hit" = "lightgrey","down" = "dodgerblue4")) +
+  facet_wrap(~time)+
+  ggtitle("NR4A1")
+
+pNR4A1
+
+```
+
+### 4.1.2 E2F1 targets 
+```{r}
+tf <- "E2F1"
+
+df <- net_dorothea %>%
+  filter(source == tf)
+
+pE2F1 <- deg %>% 
+  filter(Gene %in% df$target) %>% 
+  ggplot(aes(x = logFC, y = -log10(P.Value), colour = hit)) +
+  geom_point() +
+  geom_text_repel(aes(label = label), size =4) +
+  scale_colour_manual(values = c("up" = "indianred", "no hit" = "lightgrey","down" = "dodgerblue4")) +
+  facet_wrap(~time) + 
+  ggtitle("E2F1")
+
+pE2F1
+
+```
+
+
+## 4.2 TF based on proteomics data
+```{r}
+res_tf_enrichment <- list()
+res_tf_enrichment$enrichment <-   
+  diff_results %>%  
+  filter(modality == "proteomics") %>% 
+  mutate(Gene =feature_id)%>% 
+  ungroup() %>% 
+  distinct(time, Gene, t) %>% 
+  group_by(time) %>% 
+  nest(data = c(Gene, t))%>% 
+  mutate(ER = map(data,function(df){
+    ER = as.data.frame(
+  decoupleR::run_mlm(
+    mat = as.matrix(df %>% column_to_rownames("Gene")),
+     net=net_dorothea,
+    .source='source',
+    .target='target', 
+    .mor='mor', 
+    minsize = 5
+  ))
+  }))%>%
+    select(-data) %>%
+    unnest(cols = c(ER))
+```
+
+Visualise TFs as heatmap
+
+```{r}
+hit_tfs <- res_tf_enrichment$enrichment %>% 
+  filter(p_value < 0.03 & statistic == "mlm" & abs(score) >3)
+
+res_tf_enrichment$enrichment %>% 
+  filter(source %in% hit_tfs$source& statistic == "mlm") %>% 
+  mutate(time = factor(time, levels=c("0.08h", "1h", "12h", "24h", "48h", "72h", "96h"))) %>% 
+  acast(time~source, value.var = "score") %>% 
+  t() %>% 
+  #scale() %>% 
+   ComplexHeatmap::Heatmap(
+  cluster_columns = F,
+  # number of clusters
+  km = 5,
+  show_row_dend = F,
+  show_column_dend = F,
+  show_row_names = T,
+   row_names_gp = grid::gpar(fontsize = 8),  
+  col = circlize::colorRamp2(c(-6, 0, 6), c("blue", "white","darkred")), #mediumseagreen
+  name = "TF_score"
+  )
+```
+
+
+### Save
+
+```{r}
+save(res_tf_enrichment, file ="data/processed_data/230403_tf_enrichment_result_proteomics.RData")
+TF_proteomics <- res_tf_enrichment
+```
+
+
+## 4.3 TF based on secretomics data
+```{r}
+res_tf_enrichment <- list()
+res_tf_enrichment$enrichment <-   
+  diff_results %>%  
+  filter(modality == "secretomics") %>% 
+  mutate(Gene =feature_id)%>% 
+  ungroup() %>% 
+  distinct(time, Gene, t) %>% 
+  group_by(time) %>% 
+  nest(data = c(Gene, t))%>% 
+  mutate(ER = map(data,function(df){
+    ER = as.data.frame(
+  decoupleR::run_mlm(
+    mat = as.matrix(df %>% column_to_rownames("Gene")),
+     net=net_dorothea,
+    .source='source',
+    .target='target', 
+    .mor='mor', 
+    minsize = 5
+  ))
+  }))%>%
+    select(-data) %>%
+    unnest(cols = c(ER))
+```
+
+Visualise TFs as heatmap
+
+```{r}
+hit_tfs <- res_tf_enrichment$enrichment %>% 
+  filter(p_value < 0.03 & statistic == "mlm" & abs(score) >2) # what does this score mean? can I change it here?
+
+res_tf_enrichment$enrichment %>% 
+  filter(source %in% hit_tfs$source& statistic == "mlm") %>% 
+  mutate(time = factor(time, levels=c("12h", "24h", "48h", "72h", "96h"))) %>% 
+  acast(time~source, value.var = "score") %>% 
+  t() %>% 
+  #scale() %>% 
+   ComplexHeatmap::Heatmap(
+  cluster_columns = F,
+  # number of clusters
+  km = 5,
+  show_row_dend = F,
+  show_column_dend = F,
+  show_row_names = T,
+   row_names_gp = grid::gpar(fontsize = 8),  
+  col = circlize::colorRamp2(c(-6, 0, 6), c("blue", "white","darkred")), #mediumseagreen
+  name = "TF_score"
+  )
+
+```
+
+
+### Save
+
+```{r}
+save(res_tf_enrichment, file ="data/processed_data/230403_tf_enrichment_result_secretomics.RData")
+TF_secretomics <- res_tf_enrichment
+```
+
