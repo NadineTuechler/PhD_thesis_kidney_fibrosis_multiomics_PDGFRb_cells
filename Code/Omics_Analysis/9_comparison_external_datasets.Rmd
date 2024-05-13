@@ -1,0 +1,175 @@
+---
+title: "Compare multi-omics data to other studies"
+output:
+  html_document:
+    keep_md: yes
+    toc: yes
+    theme: united
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+# General settings
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  include = TRUE,
+  cache = TRUE,
+  cache.lazy = FALSE,
+  eval = TRUE,
+  fig.width = 4 * (1 + sqrt(5)) / 2, 
+  fig.height = 4,
+  dpi = 700
+)
+```
+
+## Packages
+
+```{r, message=F, warning =F, include=}
+library(tidyverse)
+library(ggplot2); theme_set(cowplot::theme_cowplot(font_size = 15))
+library("reshape2")
+library(ggrepel)
+library(knitr)
+library(Biostrings)
+library(RColorBrewer)
+library(ggplot2)
+library(here)
+
+mutate <- dplyr::mutate
+select <- dplyr::select
+group_by <- dplyr::group_by
+```
+
+```{r}
+options(ggplot2.discrete.colour= c("orange3", "darkslateblue", "darkred", "darkgreen", "darkgrey", "darkviolet"))
+options(ggplot2.discrete.fill= c("orange3", "darkslateblue", "darkred", "darkgreen", "darkgrey", "darkviolet"))
+tilted <-  theme(axis.text.x = element_text(angle = 45, hjust =1, vjust = 1))
+```
+
+```{r}
+secreted_proteins <- msigdbr::msigdbr(species = "Homo sapiens") %>% 
+  filter(gs_id %in% c('M5889', 'M5885'))
+
+```
+
+# Load data
+```{r}
+# data generated in this study
+diff_results <- read_tsv("data/processed_data/diff_results_20230322.tsv", show_col_types = FALSE)
+#save(diff_results, file = "corneto/diff_results_20230322.RData")
+
+# single cell data from published dataset
+tmp <- openxlsx::read.xlsx("data/41586_2020_2941_MOESM4_ESM.xlsx", sheet = "Human_PDGFRBplus_Level2_Specifi") %>% 
+  separate(`X1`, into = c("ensembl", "Gene"), remove = T, sep = ";") %>% 
+  separate(Gene, into = c("Gene", "iso"), sep = "\\.", remove = F) %>% 
+  group_by(Gene) %>% 
+  summarise_all(.funs = mean)
+```
+
+overview of genes across different cell types (Kuppe et al. 2021)
+```{r}
+heatm <- tmp %>%  select(-ensembl, -iso) %>% 
+  drop_na() %>% 
+  column_to_rownames("Gene") %>% 
+  as.matrix()%>% 
+  pheatmap::pheatmap(show_rownames = F)
+
+# pdf(file.path(here("figures"), paste0(Sys.Date(), "_heatmap.pdf")), width = 8, height = 5)
+# print(heatm)
+# dev.off()
+
+```
+
+# Decide on a specificity score cutoff
+```{r}
+quantile(tmp$Myofibroblasts, .93)
+score_count <- tmp %>% 
+  filter(Myofibroblasts > 0.2) %>% 
+  ggplot(aes(x = Myofibroblasts)) +
+  geom_histogram()
+
+tmp %>% 
+  filter(Myofibroblasts > 0.2) %>% 
+  ggplot(aes(x = Myofibroblasts)) +
+  geom_histogram()
+```
+
+#Vulcano plot 
+for hits (of my data set) that also occurred across the most specific genes of the Kuppe et al. data set
+```{r, fig.height=6}
+vulcano <- tmp %>%  select(Gene, Myofibroblasts) %>%
+  filter(Myofibroblasts > 0.2) %>%
+  inner_join(diff_results, by = c("Gene" = "feature_id")) %>%
+  mutate(secretion = ifelse(modality == "secretomics" & Gene %in% secreted_proteins$gene_symbol, "yes", "no" )) %>% 
+  filter(!(secretion == "no" & modality == "secretomics")) %>%
+  mutate(time = factor(time, levels = c("0h", "0.08h", "1h", "12h","24h", "48h", "72h", "96h"))) %>%
+  ggplot(aes(x = logFC, y = -log10(P.Value))) +
+  geom_point(size = 0.2) +
+  theme_bw() +
+  facet_grid(modality~time, scales = "free")+
+  xlim(-2,6)
+```
+
+
+```{r}
+tmp %>%  select(Gene, Myofibroblasts) %>% 
+  filter(Myofibroblasts > 0.2) %>% 
+  inner_join(diff_results, by = c("Gene" = "feature_id")) %>%
+
+#filter for secreted
+  mutate(secretion = ifelse(modality == "secretomics" & Gene %in% secreted_proteins$gene_symbol, "yes", "no" )) %>% 
+  filter(!(secretion == "no" & modality == "secretomics")) %>% 
+
+  mutate(time = factor(time, levels = c("0h", "0.08h", "1h", "12h","24h", "48h", "72h", "96h"))) %>% 
+  ggplot(aes(x = logFC, y = -log10(P.Value))) +
+  geom_point(size = 0.2) +
+  theme_bw() +
+  facet_grid(modality~time, scales = "free")
+```
+
+
+
+```{r}
+tmp %>%  select(Gene, Myofibroblasts) %>% 
+  filter(Myofibroblasts > 0.2) %>% 
+  inner_join(diff_results, by = c("Gene" = "feature_id")) %>% 
+  mutate(secretion = ifelse(modality == "secretomics" & Gene %in% secreted_proteins$gene_symbol, "yes", "no" )) %>% 
+  filter(!(secretion == "no" & modality == "secretomics")) %>% 
+  ggplot(aes(x = modality, y = abs(logFC), colour = time)) +
+  geom_boxplot()
+```
+
+# Boxplot
+```{r}
+
+# Define color palette
+colors <- c("up" = "#9E1021", "down" = "#4391C1")
+
+boxplot <- tmp %>%  select(Gene, Myofibroblasts) %>% 
+  filter(Myofibroblasts > 0.2) %>% 
+  inner_join(diff_results, by = c("Gene" = "feature_id")) %>%
+  mutate(secretion = ifelse(modality == "secretomics" & Gene %in% secreted_proteins$gene_symbol, "yes", "no" )) %>% 
+  filter(!(secretion == "no" & modality == "secretomics")) %>%
+  mutate(time = factor(time, levels = c("0h", "0.08h", "1h", "12h","24h", "48h", "72h", "96h"))) %>% 
+  mutate(hit = ifelse(abs(logFC) > log2(1.5) & adj.P.Val < 0.05, "hit", "no hit")) %>%
+  mutate(direction = ifelse(logFC > 0, "up", "down")) %>% 
+  filter(hit =="hit") %>% 
+  ggplot(aes(x = time, fill = direction)) +
+  geom_bar() +
+  facet_wrap(~modality, scales = "free") +
+  scale_fill_manual(values = colors)
+
+
+tt <- tmp %>%  select(Gene, Myofibroblasts) %>% 
+  filter(Myofibroblasts > 0.2) %>% 
+  mutate(secretion = ifelse(modality == "secretomics" & Gene %in% secreted_proteins$gene_symbol, "yes", "no" )) %>% 
+  filter(!(secretion == "no" & modality == "secretomics")) %>%
+  inner_join(diff_results, by = c("Gene" = "feature_id")) %>%
+  mutate(time = factor(time, levels = c("0h", "0.08h", "1h", "12h","24h", "48h", "72h", "96h"))) %>% 
+  mutate(hit = ifelse(abs(logFC) > log2(1.5) & adj.P.Val < 0.05, "hit", "no hit")) 
+```
